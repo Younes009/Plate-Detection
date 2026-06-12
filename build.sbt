@@ -5,8 +5,10 @@ val sparkVersion = "3.5.1"
 
 lazy val commonSettings = Seq(
   libraryDependencies ++= Seq(
-    "org.apache.spark" %% "spark-core" % sparkVersion % "provided",
-    "org.apache.spark" %% "spark-sql"  % sparkVersion % "provided"
+    "org.apache.spark" %% "spark-core"  % sparkVersion % "provided",
+    "org.apache.spark" %% "spark-sql"   % sparkVersion % "provided",
+    "org.apache.spark" %% "spark-mllib" % sparkVersion % "provided",
+    "org.scala-lang.modules" %% "scala-xml" % "2.1.0"
   ),
   assembly / assemblyMergeStrategy := {
     case PathList("META-INF", xs @ _*) => MergeStrategy.discard
@@ -18,22 +20,27 @@ lazy val common = (project in file("common"))
   .settings(commonSettings)
   .settings(name := "common")
 
+lazy val ml = (project in file("ml"))
+  .dependsOn(common)
+  .settings(commonSettings)
+  .settings(name := "ml")
+
 lazy val producer = (project in file("producer"))
   .dependsOn(common)
   .settings(commonSettings)
   .settings(
     name := "producer",
-    assembly / mainClass := Some("ProducerApp")
+    assembly / mainClass := Some("com.project.producer.ProducerApp")
   )
 
 lazy val consumer = (project in file("consumer"))
-  .dependsOn(common)
+  .dependsOn(common, ml)
   .settings(commonSettings)
   .settings(
     name := "consumer",
-    assembly / mainClass := Some("ConsumerApp")
+    assembly / mainClass := Some("com.project.consumer.ConsumerApp")
   )
 
 lazy val root = (project in file("."))
-  .aggregate(common, producer, consumer)
+  .aggregate(common, ml, producer, consumer)
   .settings(name := "spark-batch-streaming")

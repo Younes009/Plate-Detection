@@ -1,3 +1,5 @@
+package com.project.common
+
 import org.apache.spark.sql.Column
 import org.apache.spark.sql.expressions.UserDefinedFunction
 import org.apache.spark.sql.functions._
@@ -6,13 +8,16 @@ import java.awt.{Color, RenderingHints}
 import java.awt.image.BufferedImage
 import java.io.{ByteArrayInputStream, ByteArrayOutputStream}
 import javax.imageio.ImageIO
+import scala.xml.XML
 
 object HdfsPaths {
-  val RAW        = "hdfs:///project/raw/"
-  val PROCESSED  = "hdfs:///project/processed/"
-  val STAGING    = "hdfs:///project/staging/"
-  val LOGS       = "hdfs:///project/logs/"
-  val CHECKPOINT = "hdfs:///project/checkpoint/"
+  val RAW                   = "hdfs:///project/raw/"
+  val PROCESSED             = "hdfs:///project/processed/"
+  val PROCESSED_PREDICTIONS = "hdfs:///project/processed/predictions/"
+  val STAGING               = "hdfs:///project/staging/"
+  val LOGS                  = "hdfs:///project/logs/"
+  val CHECKPOINT            = "hdfs:///project/checkpoint/"
+  val MODELS                = "hdfs:///project/models/"
 }
 
 object PreprocessingConfig {
@@ -26,6 +31,7 @@ object Schemas {
     StructField("image_name", StringType, nullable = false),
     StructField("split", StringType, nullable = false),
     StructField("image_path", StringType, nullable = false),
+    StructField("label", StringType, nullable = true),
     StructField("orig_width", IntegerType, nullable = false),
     StructField("orig_height", IntegerType, nullable = false),
     StructField("image_data", BinaryType, nullable = false),
@@ -64,7 +70,7 @@ object ImagePreprocessing {
   /**
    * Redimensionne une image en conservant son ratio d'aspect (letterbox) puis ajoute
    * du padding noir pour obtenir une image carrée IMG_SIZE x IMG_SIZE.
-   * padX/padY (normalisés [0,1]) permettent de reprojeter les bounding boxes YOLO.
+   * padX/padY (normalisés [0,1]) permettent de reprojeter les bounding boxes.
    */
   val letterboxResize: UserDefinedFunction = udf((content: Array[Byte]) => {
     try {
@@ -116,4 +122,47 @@ object Features {
     when(cyNorm.isNull, lit(null: String))
       .when(cyNorm < 0.5, lit("top"))
       .otherwise(lit("bottom"))
+}
+
+// Annotation unifiée (YOLO / COCO / Pascal VOC), bbox normalisée [0,1] format YOLO (cx, cy, w, h)
+case class RawAnnotation(classId: Int, label: String, cx: Double, cy: Double, w: Double, h: Double)
+
+object AnnotationParsers {
+
+  // YOLO : "class_id cx cy w h" (déjà normalisé)
+  def parseYoloLine(line: String, classNames: Map[Int, String]): Option[RawAnnotation] = {
+    val parts = line.trim.split("\\s+")
+    if (parts.length < 5) None
+    else {
+      val classId = parts(0).toInt
+      Some(RawAnnotation(
+        classId,
+        classNames.getOrElse(classId, s"class_$classId"),
+        parts(1).toDouble, parts(2).toDouble, parts(3).toDouble, parts(4).toDouble
+      ))
+    }
+  }
+
+  // Pascal VOC : <annotation><size><width/height></size><object><name/><bndbox>{xmin,ymin,xmax,ymax}</bndbox></object></annotation>
+  def parseVocXml(content: String): Seq[RawAnnotation] = {
+    try {
+      val xml = XML.loadString(content)
+      val imgW = (xml \ "size" \ "width").text.trim.toDouble
+      val imgH = (xml \ "size" \ "height").text.trim.toDouble
+      (xml \ "object").map { obj =>
+        val name = (obj \ "name").text.trim
+        val xmin = (obj \ "bndbox" \ "xmin").text.trim.toDouble
+        val ymin = (obj \ "bndbox" \ "ymin").text.trim.toDouble
+        val xmax = (obj \ "bndbox" \ "xmax").text.trim.toDouble
+        val ymax = (obj \ "bndbox" \ "ymax").text.trim.toDouble
+        val w = (xmax - xmin) / imgW
+        val h = (ymax - ymin) / imgH
+        val cx = (xmin + xmax) / 2.0 / imgW
+        val cy = (ymin + ymax) / 2.0 / imgH
+        RawAnnotation(math.abs(name.hashCode) % 1000, name, cx, cy, w, h)
+      }
+    } catch {
+      case _: Exception => Seq.empty
+    }
+  }
 }
