@@ -8,7 +8,7 @@ license-plate-detection-dataset-10125-images/
                 │
                 ▼
 ┌─────────────────────────────────────────────┐
-│ 1-spark-preprocessing (Scala/Spark, HDFS)    │
+│ Pipeline Spark (Scala, HDFS)                 │
 │                                               │
 │  ProducerApp (batch, 1x)                     │
 │   - lit images+labels YOLO                   │
@@ -32,7 +32,7 @@ license-plate-detection-dataset-10125-images/
 └─────────────────────────────────────────────┘
 ```
 
-## Flux détaillé — `1-spark-preprocessing` (HDFS)
+## Flux détaillé (HDFS)
 
 ```
 hdfs:///project/staging/dataset/{train,valid,test}/{images,labels}
@@ -66,13 +66,11 @@ hdfs:///project/logs/producer/      <- parquet append, 1 ligne/run
 ```
 plate-detection-spark/
 ├── license-plate-detection-dataset-10125-images/   ← Dataset YOLO (train/valid/test)
-│
-└── 1-spark-preprocessing/        ← Pipeline Spark (Scala)
-    ├── producer/   ← Batch : images+labels YOLO -> letterbox -> raw/
-    ├── consumer/   ← Streaming : raw/ -> filtre/enrichit -> processed/
-    ├── common/     ← Schémas, chemins HDFS, prétraitement image
-    ├── streamlit/app.py ← Dashboard visu uniquement <- processed/
-    └── build.sbt
+├── build.sbt
+├── common/src/main/scala/Utils.scala      ← Schémas, chemins HDFS, prétraitement image
+├── producer/src/main/scala/ProducerApp.scala   ← Batch : images+labels YOLO -> letterbox -> raw/
+├── consumer/src/main/scala/ConsumerApp.scala   ← Streaming : raw/ -> filtre/enrichit -> processed/
+└── streamlit/app.py                       ← Dashboard visu uniquement <- processed/
 ```
 
 ## HDFS structure obligatoire (`.claude/prompt.md`)

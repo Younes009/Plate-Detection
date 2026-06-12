@@ -1,211 +1,78 @@
-Tu es un expert Apache Spark (Scala) spécialisé en architectures Big Data industrielles (niveau production : Uber / Netflix / Airbnb).
+Act en tant que Principal Data Engineer et Architecte Big Data Senior (niveau d'exigence : Uber, Netflix, Airbnb). Tu dois concevoir l'intégralité d'un pipeline de production Big Data pour la détection de plaques d'immatriculation à partir du jeu de données "license-plate-detection-dataset-10125-images" (contenant des images JPEG/PNG haute résolution et des bounding boxes aux formats YOLO/COCO/Pascal VOC).
 
-Tu dois générer un projet COMPLET, EXÉCUTABLE et STRICTEMENT conforme.
+Génère un projet COMPLET, EXÉCUTABLE, SANS AUCUN RACCOURCI ni "TODO", respectant scrupuleusement les exigences industrielles ci-dessous.
 
-────────────────────────────────────────
-OBJECTIF GLOBAL
-────────────────────────────────────────
+────────────────────────────────────────────────────────────────────────────────
+1. ARCHITECTURE ET ARBORESCENCE DU PROJET
+   ────────────────────────────────────────────────────────────────────────────────
+   Génère l'arborescence exacte et crée l'intégralité du code pour chacun des fichiers suivants :
+   /build.sbt
+   /common/src/main/scala/com/project/common/Utils.scala
+   /producer/src/main/scala/com/project/producer/ProducerApp.scala
+   /consumer/src/main/scala/com/project/consumer/ConsumerApp.scala
+   /ml/src/main/scala/com/project/ml/ModelLoader.scala
+   /streamlit/app.py
 
-Construire un pipeline Big Data complet basé sur :
+────────────────────────────────────────────────────────────────────────────────
+2. CONFIGURATION BUILD (build.sbt)
+   ────────────────────────────────────────────────────────────────────────────────
+   Fournis un fichier `build.sbt` multi-modules complet pour Scala 2.12.18+ et Spark 3.5.x.
+- Modules : `common`, `producer`, `consumer`, `ml`.
+- Incluts explicitement toutes les dépendances nécessaires : `spark-core`, `spark-sql`, `spark-mllib`, ainsi que les connecteurs natifs ou librairies de parsing JSON/XML si nécessaires pour COCO/Pascal VOC.
+- Configure une stratégie de merge propre (`assemblyMergeStrategy`) pour éviter les conflits lors de la génération des Fat Jars.
 
-Dataset:
-license-plate-detection-dataset-10125-images
+────────────────────────────────────────────────────────────────────────────────
+3. MODULE PRODUCER : INGESTION BATCH STRICTE
+   ────────────────────────────────────────────────────────────────────────────────
+   Fichier : `ProducerApp.scala`
+- Paradigme : Batch Pur (Exécution unique, arrêt automatique après traitement, interdiction d'utiliser des boucles infinies ou du streaming).
+- Logique métier :
+    1. Parcourir récursivement le dossier du dataset d'images et ses fichiers d'annotations (YOLO/COCO/Pascal VOC).
+    2. Parser les annotations pour extraire : `image_path`, `label`, `bbox` (coordonnées normalisées ou absolues), et `class`.
+    3. Structurer ces données dans un DataFrame Spark natif fortement typé (sans passer par les RDDs bas niveau).
+    4. Appliquer un nettoyage rigoureux (gestion des valeurs manquantes, validation des chemins d'images).
+- Écriture : Écrire le DataFrame final au format Parquet optimisé (avec compression Snappy) à l'emplacement exact : `hdfs:///project/raw/`.
 
-Contenu:
-- images JPEG/PNG haute résolution
-- annotations bounding boxes
-- formats: YOLO / COCO / Pascal VOC
+────────────────────────────────────────────────────────────────────────────────
+4. MODULE CONSUMER : STRUCTURED STREAMING & ML DOUBLE FLUX
+   ────────────────────────────────────────────────────────────────────────────────
+   Fichier : `ConsumerApp.scala`
+   C'est le cœur du système. Tu dois implémenter une architecture de double lecture et double écriture en streaming continu :
 
-Pipeline:
-Batch ingestion → HDFS RAW → Streaming processing + ML → HDFS PROCESSED → Streamlit
+- FLUX DE LECTURE N°1 (Data Stream) :
+  Utilise obligatoirement `spark.readStream` au format Parquet sur `hdfs:///project/raw/`. Configure l'inférence de schéma explicite (`schema`) pour garantir la stabilité du flux.
 
-────────────────────────────────────────
-ARCHITECTURE VISUELLE OBLIGATOIRE
-────────────────────────────────────────
+- FLUX DE LECTURE N°2 (Modèle ML) :
+  Charge un modèle d'inférence (via `ModelLoader.scala`). Ce modèle peut être un modèle Spark MLlib (`PipelineModel` ou `RandomForestClassificationModel`) préalablement entraîné, ou un modèle d'inférence simulé de manière très réaliste (Fallback d'évaluation orienté computer vision avec score de confiance et prédiction de classe).
 
-Respect EXACT du flux :
+- LOGIQUE DE MICRO-BATCH ET PROCESSING :
+  Pour chaque micro-batch, applique un filtrage des anomalies, du feature engineering de production, puis injecte le modèle ML pour ajouter deux colonnes calculées au flux : `prediction` (string/int) et `confidence_score` (double).
 
-\documentclass[tikz,border=10mm]{standalone}
-\usetikzlibrary{shapes.geometric, arrows.meta, positioning, calc}
-\usepackage{xcolor}
+- DOUBLE ÉCRITURE SÉCURISÉE :
+    1. Écriture principale : Enregistrer le flux enrichi (features, labels, metadata, prédictions) dans `hdfs:///project/processed/` en mode `append`.
+    2. Écriture dédiée aux prédictions : Enregistrer de manière isolée un sous-ensemble critique (`image_path`, `prediction`, `confidence_score`) dans `hdfs:///project/processed/predictions/`.
 
-\definecolor{sparkgreen}{HTML}{7FFF00}
-\definecolor{pythonorange}{HTML}{DEB887}
-\definecolor{predictpurple}{HTML}{DA70D6}
-\definecolor{streamlitblue}{HTML}{87CEEB}
+- TOLÉRANCE AUX PANNES :
+  Configure obligatoirement un mécanisme de Checkpointing strict sur `hdfs:///project/checkpoint/` pour garantir la sémantique "Exactly-Once". Le flux doit se terminer par `awaitTermination()` pour tourner indéfiniment.
 
-\begin{document}
-\begin{tikzpicture}
+────────────────────────────────────────────────────────────────────────────────
+5. INTERFACE UTILISATEUR (Streamlit)
+   ────────────────────────────────────────────────────────────────────────────────
+   Fichier : `app.py`
+   Développe une application Streamlit complète et élégante.
+- Contrainte absolue : Lecture seule (`READ ONLY`). L'application ne doit effectuer aucun calcul de Machine Learning ni aucune transformation lourde.
+- Logique : Elle doit se connecter via un client compatible (ou simuler proprement l'accès aux répertoires HDFS) pour lire directement `hdfs:///project/processed/` et `hdfs:///project/processed/predictions/`.
+- Fonctionnalités graphiques :
+    - Rafraîchissement automatique ou bouton de synchronisation des données du stream.
+    - Dashboards de KPIs majeurs (nombre de plaques détectées, taux de confiance moyen).
+    - Graphiques et histogrammes dynamiques de la distribution des scores de confiance.
+    - Table de données filtrable par classe ou par seuil de confiance.
 
-\node (source) {Dataset Images + Labels};
-\node (producer) [right=of source] {PRODUCER (Spark Core Scala BATCH)};
-\node (raw) [right=of producer] {hdfs:///project/raw/};
+────────────────────────────────────────────────────────────────────────────────
+6. EXPLICATIONS ET DEPLOYMENT GUIDE
+   ────────────────────────────────────────────────────────────────────────────────
+   En fin de réponse, fournis un guide d'exécution concis décrivant :
+1. La structure de dossiers requise au sein de HDFS (`/raw`, `/processed`, `/processed/predictions`, `/staging`, `/logs`, `/checkpoint`).
+2. Les commandes `spark-submit` exactes pour lancer le Producer (Batch) puis le Consumer (Streaming) avec les configurations mémoire d'usage en production.
 
-\node (consumer) [below=of raw] {CONSUMER (Structured Streaming + ML)};
-\node (processed) [right=of consumer] {hdfs:///project/processed/};
-
-\node (streamlit) [below=of processed] {STREAMLIT (READ ONLY)};
-
-\draw[->] (source) -- (producer) node[midway,above]{READ};
-\draw[->] (producer) -- (raw) node[midway,above]{WRITE PARQUET};
-
-\draw[->] (raw) -- (consumer) node[midway,right]{READ STREAM (DATA)};
-
-\draw[->] (consumer) -- (processed) node[midway,above]{WRITE PREDICTIONS};
-
-\draw[->] (processed) -- (streamlit) node[midway,right]{READ ONLY};
-
-\end{tikzpicture}
-\end{document}
-
-────────────────────────────────────────
-ARCHITECTURE PRODUCER (BATCH ONLY)
-────────────────────────────────────────
-
-- Spark Core + Scala uniquement
-- Lit dataset images + annotations
-- Parse YOLO / COCO
-- Nettoyage + structuration
-
-Sortie DataFrame :
-(image_path, label, bbox, class)
-
-Écriture UNIQUE :
-hdfs:///project/raw/ (Parquet)
-
-STOP après écriture
-AUCUN streaming
-AUCUNE boucle infinie
-
-────────────────────────────────────────
-ARCHITECTURE CONSUMER (TRÈS IMPORTANT)
-────────────────────────────────────────
-
-Le consumer fait DOUBLE LECTURE + DOUBLE USAGE :
-
-────────────────────────────
-1. READ #1 → DATA STREAM
-   ────────────────────────────
-- Lit en continu depuis :
-  hdfs:///project/raw/
-- Obligatoire : readStream Spark Structured Streaming
-- Contient images + labels
-
-────────────────────────────
-2. READ #2 → MODEL
-   ────────────────────────────
-- Charge un modèle ML (Spark MLlib ou modèle simulé)
-- Ce modèle est utilisé pour la prédiction
-- Peut être :
-    - LogisticRegressionModel
-    - RandomForestModel
-    - ou scoring simulé (fallback accepté)
-
-────────────────────────────
-3. PROCESSING
-   ────────────────────────────
-   Sur chaque micro-batch :
-- filter
-- feature engineering
-- prédiction ML :
-  → ajout colonne "prediction"
-  → ajout colonne "confidence_score"
-
-────────────────────────────
-4. WRITE #1 → PROCESSED DATA
-   ────────────────────────────
-   hdfs:///project/processed/
-   Contient :
-- données enrichies
-- features
-- labels
-- metadata
-
-────────────────────────────
-5. WRITE #2 → PREDICTIONS OUTPUT
-   ────────────────────────────
-   Optionnel mais OBLIGATOIRE conceptuellement :
-   hdfs:///project/processed/predictions/
-
-Contient :
-- image_path
-- prediction
-- confidence_score
-
-────────────────────────────
-6. STREAMING RULE
-   ────────────────────────────
-- append mode
-- checkpoint obligatoire:
-  hdfs:///project/checkpoint/
-- awaitTermination()
-- tourne indéfiniment
-
-────────────────────────────────────────
-HDFS STRUCTURE
-────────────────────────────────────────
-hdfs:///project/raw/
-hdfs:///project/processed/
-hdfs:///project/processed/predictions/
-hdfs:///project/staging/
-hdfs:///project/logs/
-hdfs:///project/checkpoint/
-
-────────────────────────────────────────
-CONTRAINTES TECHNIQUES
-────────────────────────────────────────
-- Scala 2.12+
-- Spark 3.x
-- DataFrame API ONLY (NO RDD)
-- Parquet obligatoire
-- HDFS ONLY
-- Producer = batch strict
-- Consumer = streaming strict
-- readStream obligatoire
-
-────────────────────────────────────────
-STREAMLIT
-────────────────────────────────────────
-- lit uniquement :
-  hdfs:///project/processed/
-  hdfs:///project/processed/predictions/
-
-- aucun calcul ML
-- uniquement visualisation :
-    - dashboards
-    - filtres
-    - histogrammes de prédictions
-
-────────────────────────────────────────
-STRUCTURE PROJET
-────────────────────────────────────────
-
-/producer/src/main/scala/ProducerApp.scala
-/consumer/src/main/scala/ConsumerApp.scala
-/common/Utils.scala
-/ml/ModelLoader.scala (optionnel)
-/streamlit/app.py
-/build.sbt
-
-────────────────────────────────────────
-OUTPUT ATTENDU
-────────────────────────────────────────
-1. Producer Scala complet (batch)
-2. Consumer Scala complet (streaming + ML + double read + double write)
-3. build.sbt complet
-4. Streamlit app.py
-5. explication du pipeline
-
-────────────────────────────────────────
-RÈGLES CRITIQUES
-────────────────────────────────────────
-- Producer exécute UNE SEULE FOIS
-- Consumer tourne INFINIMENT
-- Consumer lit :
-  ✔ data (raw)
-  ✔ model (ML)
-- Consumer écrit :
-  ✔ processed dataset
-  ✔ predictions dataset
-- readStream obligatoire
-- architecture strictement respectée
+Ne fais aucune concession sur la syntaxe Scala ou Python. Fournis un code propre, modulaire et directement compilable.
