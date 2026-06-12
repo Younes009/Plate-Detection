@@ -4,8 +4,8 @@ import org.apache.spark.sql.streaming.Trigger
 
 /**
  * Consumer STREAMING (Spark Structured Streaming + Scala).
- * - Lit en continu hdfs:///project/raw/ (readStream, Parquet)
- * - Filtre, enrichit (risk_score)
+ * - Lit en continu hdfs:///project/raw/ (readStream, Parquet, dataset prétraité plaques)
+ * - Filtre les images sans détection + ajoute un flag qualité sur la bbox
  * - Écrit en continu vers hdfs:///project/processed/
  * - Checkpoint : hdfs:///project/checkpoint/
  * - Tourne indéfiniment (awaitTermination)
@@ -20,13 +20,16 @@ object ConsumerApp {
 
     // --- 1. Lecture en streaming depuis HDFS (raw) ---
     val rawStream = spark.readStream
-      .schema(Schemas.plateDetectionSchema)
+      .schema(Schemas.preprocessedSchema)
       .parquet(HdfsPaths.RAW)
 
     // --- 2. Transformations : filtre + enrichissement ---
     val enrichedStream = rawStream
-      .filter(col("confidence") >= 0.5)
-      .withColumn("risk_level", Scoring.riskScoreExpr)
+      .filter(col("num_boxes") > 0)
+      .withColumn("quality_flag",
+        when(col("bbox_area_norm") < 0.005, lit("TOO_SMALL"))
+          .when(col("aspect_ratio") > 6 || col("aspect_ratio") < (1.0 / 6), lit("BAD_RATIO"))
+          .otherwise(lit("OK")))
       .withColumn("processed_at", current_timestamp())
 
     // --- 3. Écriture en continu vers processed (Parquet + checkpoint) ---
@@ -40,14 +43,16 @@ object ConsumerApp {
 
     // --- 3bis. (Bonus) Agrégation streaming par fenêtre temporelle ---
     val aggStream = rawStream
-      .withWatermark("detected_at", "1 minute")
+      .withWatermark("ingested_at", "1 minute")
       .groupBy(
-        window(col("detected_at"), "1 minute"),
-        col("vehicle_type")
+        window(col("ingested_at"), "1 minute"),
+        col("split"),
+        col("bbox_size_category")
       )
       .agg(
-        count("*").as("nb_detections"),
-        avg("confidence").as("avg_confidence")
+        count("*").as("nb_images"),
+        avg("aspect_ratio").as("avg_aspect_ratio"),
+        avg("num_boxes").as("avg_num_boxes")
       )
 
     val aggQuery = aggStream.writeStream

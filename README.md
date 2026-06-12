@@ -1,6 +1,8 @@
 # 🚗 License Plate Detection — Projet Spark Core
 
-Architecture **3 microservices** pour la détection de plaques d'immatriculation.
+Architecture **microservices** pour la détection de plaques d'immatriculation.
+
+Voir [ARCHITECTURE.md](ARCHITECTURE.md) pour le schéma d'archi et le flux de données détaillé.
 
 ---
 
@@ -11,12 +13,12 @@ Projet Spark Core/
 │
 ├── license-plate-detection-dataset-10125-images/   ← Dataset YOLO (train/valid/test)
 │
-├── 1-preprocessing-pyspark/     ← Microservice 1 : Lecture & Prétraitement PySpark
-│   ├── preprocessing.py         ← Script principal PySpark
-│   ├── requirements.txt
-│   ├── README.md
-│   └── output/
-│       └── dataset_ready.csv    ← CSV généré (features pour entraînement)
+├── 1-spark-preprocessing/      ← Microservice 1 : Prétraitement Spark (Scala)
+│   ├── producer/   ← Batch : lecture images+labels YOLO, letterbox resize,
+│   │                  features bbox, écriture unique -> hdfs:///project/raw/
+│   ├── consumer/   ← Streaming : readStream raw/ -> filtre/enrichit -> processed/
+│   ├── common/     ← Schémas, chemins HDFS, prétraitement image
+│   └── build.sbt
 │
 ├── 2-model-training/            ← Microservice 2 : Entraînement YOLOv8
 │   ├── training.ipynb           ← Notebook Jupyter complet
@@ -44,13 +46,21 @@ Projet Spark Core/
 
 ## 🚀 Ordre d'exécution
 
-### Étape 1 — Prétraitement PySpark
+### Étape 1 — Prétraitement Spark (Scala, batch + streaming)
 ```bash
-cd 1-preprocessing-pyspark
-pip install -r requirements.txt
-python preprocessing.py
-# → Génère output/dataset_ready.csv
+cd 1-spark-preprocessing
+sbt clean assembly
+
+# Producer (batch, une seule exécution) -> hdfs:///project/raw/
+spark-submit --class ProducerApp --master yarn \
+  producer/target/scala-2.12/producer-assembly-0.1.0.jar \
+  hdfs:///project/staging/dataset
+
+# Consumer (streaming, tourne en continu) -> hdfs:///project/processed/
+spark-submit --class ConsumerApp --master yarn \
+  consumer/target/scala-2.12/consumer-assembly-0.1.0.jar
 ```
+Voir `1-spark-preprocessing/README.md` pour le détail.
 
 ### Étape 2 — Entraînement du modèle
 ```bash
@@ -93,6 +103,6 @@ streamlit run app.py
 
 | Couche | Technologies |
 |---|---|
-| Preprocessing | PySpark 3.x, Pillow |
+| Preprocessing | Apache Spark 3.x (Scala), Structured Streaming, HDFS, Parquet |
 | Entraînement | YOLOv8 (Ultralytics), Pandas, Matplotlib |
 | Interface | Flask, HTML/CSS/JS (Vanilla) |

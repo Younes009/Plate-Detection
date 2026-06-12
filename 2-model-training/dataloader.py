@@ -263,7 +263,7 @@ def create_dataloaders(
 # ============================================================================
 if __name__ == "__main__":
     # Test rapide
-    data_root = "../1-preprocessing-pyspark/data/processed"
+    data_root = "../1-spark-preprocessing/data/processed"
 
     print("🧪 Testing DataLoader...")
 

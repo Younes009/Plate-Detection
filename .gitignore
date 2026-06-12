@@ -26,6 +26,11 @@ spark-warehouse/
 metastore_db/
 derby.log
 
+# sbt / Scala build outputs
+target/
+project/target/
+project/project/
+
 # Data files (trop lourds pour git)
 *.parquet
 *.json

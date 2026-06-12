@@ -31,7 +31,7 @@ from loss import create_ssd_loss
 # ============================================================================
 DEFAULT_CONFIG = {
     # Paths
-    'data_root': '../1-preprocessing-pyspark/data/processed',
+    'data_root': '../1-spark-preprocessing/data/processed',
     'output_dir': './checkpoints',
     'log_dir': './logs',
 
