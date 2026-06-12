@@ -20,25 +20,21 @@ Projet Spark Core/
 │   ├── common/     ← Schémas, chemins HDFS, prétraitement image
 │   └── build.sbt
 │
-├── 2-model-training/            ← Microservice 2 : Entraînement YOLOv8
-│   ├── training.ipynb           ← Notebook Jupyter complet
+├── 2-model-training/             ← Microservice 2 : Entraînement (PyTorch)
+│   ├── train.py, dataloader.py, model.py, loss.py
 │   ├── requirements.txt
-│   └── models/                  ← Modèles entraînés & graphiques
-│       ├── data.yaml
-│       ├── best.pt              ← Meilleur modèle après entraînement
-│       └── license_plate_yolov8n/
+│   └── checkpoints/
+│       └── best_model.pt        ← Meilleur modèle après entraînement
 │
-└── 3-web-interface/             ← Microservice 3 : Interface Web Flask
-    ├── app.py                   ← API Flask (EDA + Prediction)
+└── 3-web-interface/              ← Microservice 3 : FastAPI + Streamlit
+    ├── api.py                   ← Backend FastAPI (port 8000)
+    ├── app.py                   ← Frontend Streamlit (port 8501)
+    ├── inference.py             ← Charge ../2-model-training/checkpoints/best_model.pt
+    ├── spark_batch.py           ← Inférence batch (PySpark, >3 images)
+    ├── run.sh                   ← Lance api+streamlit (api|streamlit|both)
     ├── requirements.txt
-    ├── model/
-    │   └── best.pt              ← Modèle copié depuis MS2
-    ├── templates/
-    │   ├── index.html           ← Dashboard EDA
-    │   └── predict.html         ← Page prédiction
-    ├── static/
-    │   ├── css/style.css
-    │   └── js/main.js & predict.js
+    ├── history.csv              ← Historique des prédictions
+    ├── images/                  ← original.jpg + annotated.jpg par prédiction
     └── uploads/                 ← Images uploadées temporairement
 ```
 
@@ -66,36 +62,36 @@ Voir `1-spark-preprocessing/README.md` pour le détail.
 ```bash
 cd 2-model-training
 pip install -r requirements.txt
-jupyter notebook training.ipynb
-# → Entraîne YOLOv8, exporte best.pt vers 3-web-interface/model/
+python train.py
+# → Entraîne le modèle, sauvegarde checkpoints/best_model.pt
 ```
 
-### Étape 3 — Interface Web
-
-- Pour lancer l'API :
+### Étape 3 — Interface Web (FastAPI + Streamlit)
 ```bash
 cd 3-web-interface
 pip install -r requirements.txt
-python app.py
-# → http://localhost:5000
-```
 
-- Pour lancer l'interface : 
-```bash
-cd 3-web-interface
-cd StreamLit_App
-streamlit run app.py
-# → http://localhost:8502
+./run.sh           # FastAPI (8000) + Streamlit (8501)
+# ou séparément :
+./run.sh api        # FastAPI seule  -> http://localhost:8000 (docs: /docs)
+./run.sh streamlit  # Streamlit seule -> http://localhost:8501
 ```
+`inference.py` charge le modèle depuis `../2-model-training/checkpoints/best_model.pt`.
+
 ---
 
-## 🔗 Pages de l'interface web
+## 🔗 Endpoints de l'API (FastAPI, port 8000)
 
 | Route | Description |
 |---|---|
-| `http://localhost:5000/` | Dashboard EDA avec graphiques |
-| `http://localhost:5000/predict` | Prédiction sur image uploadée |
-| `http://localhost:5000/api/stats` | API JSON des statistiques |
+| `GET /` | Infos API |
+| `GET /health`, `/api/health` | Health check |
+| `GET /api/stats` | Statistiques JSON |
+| `POST /predict`, `/api/predict` | Prédiction sur une image |
+| `POST /predict_batch` | Prédiction batch (PySpark, `spark_batch.py`) |
+| `GET /history` | Historique des prédictions |
+
+L'UI Streamlit (port 8501) consomme ces endpoints.
 
 ---
 
@@ -104,5 +100,5 @@ streamlit run app.py
 | Couche | Technologies |
 |---|---|
 | Preprocessing | Apache Spark 3.x (Scala), Structured Streaming, HDFS, Parquet |
-| Entraînement | YOLOv8 (Ultralytics), Pandas, Matplotlib |
-| Interface | Flask, HTML/CSS/JS (Vanilla) |
+| Entraînement | PyTorch, Pandas, Matplotlib |
+| Interface | FastAPI, Streamlit, PySpark (inférence batch) |

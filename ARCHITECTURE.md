@@ -29,17 +29,21 @@ license-plate-detection-dataset-10125-images/
                 │ processed/ (parquet: image_data, bbox feats, quality_flag)
                 ▼
 ┌─────────────────────────────────────────────┐
-│ 2-model-training (Python)                    │
-│  dataloader.py -> model.py (YOLO-like)       │
-│  train.py -> checkpoints/, best.pt           │
+│ 2-model-training (Python / PyTorch)          │
+│  dataloader.py -> model.py + loss.py         │
+│  train.py -> checkpoints/best_model.pt       │
 └─────────────────────────────────────────────┘
-                │ best.pt
+                │ checkpoints/best_model.pt
                 ▼
 ┌─────────────────────────────────────────────┐
-│ 3-web-interface (Flask)                      │
-│  app.py / api.py -> inference.py (best.pt)   │
-│  spark_batch.py -> stats/EDA                 │
-│  history.csv (log prédictions + images/)     │
+│ 3-web-interface (FastAPI + Streamlit)        │
+│  api.py (FastAPI :8000) -> inference.py      │
+│    -> charge ../2-model-training/            │
+│       checkpoints/best_model.pt              │
+│  api.py -> spark_batch.py (PySpark,          │
+│             inférence batch si >3 images)    │
+│  app.py (Streamlit :8501) -> appelle api.py  │
+│  history.csv + images/ (log prédictions)     │
 └─────────────────────────────────────────────┘
 ```
 
@@ -79,14 +83,17 @@ plate-detection-spark/
 │   ├── common/     ← Schémas, chemins HDFS, prétraitement image
 │   └── build.sbt
 │
-├── 2-model-training/             ← Microservice 2 : Entraînement YOLOv8
+├── 2-model-training/              ← Microservice 2 : Entraînement (PyTorch)
 │   ├── train.py, dataloader.py, model.py, loss.py
-│   └── checkpoints/, best.pt
+│   └── checkpoints/best_model.pt
 │
-└── 3-web-interface/               ← Microservice 3 : Interface Web Flask
-    ├── app.py, api.py, inference.py, spark_batch.py
-    ├── model/best.pt
-    └── history.csv
+└── 3-web-interface/                ← Microservice 3 : FastAPI + Streamlit
+    ├── api.py        ← FastAPI (port 8000) -> inference.py -> spark_batch.py
+    ├── app.py        ← Streamlit (port 8501), appelle api.py
+    ├── inference.py  ← charge ../2-model-training/checkpoints/best_model.pt
+    ├── spark_batch.py ← inférence batch PySpark (>3 images)
+    ├── run.sh        ← lance api|streamlit|both
+    ├── history.csv, images/, uploads/
 ```
 
 ## Connu / à recâbler
