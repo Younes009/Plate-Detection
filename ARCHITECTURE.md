@@ -25,6 +25,10 @@ license-plate-detection-dataset-10125-images/
 │   - aggStream (window 1min/split/size_cat)   │
 │     -> processed/aggregates/                 │
 │     + checkpoint/aggregates/                 │
+│                                               │
+│  streamlit/app.py (visu uniquement)          │
+│   - lit processed/ + processed/aggregates/   │
+│   - charts / filtres / tables, pas de calcul │
 └─────────────────────────────────────────────┘
                 │ processed/ (parquet: image_data, bbox feats, quality_flag)
                 ▼
@@ -60,6 +64,9 @@ hdfs:///project/raw/                <- parquet, schema preprocessedSchema
    bbox_area(_norm), aspect_ratio,
    bbox_size_category, center_x/y_quadrant,
    num_boxes, ingested_at
+
+hdfs:///project/logs/producer/      <- parquet append, 1 ligne/run
+   run_at, dataset_path, nb_images, nb_rows
         │
         ▼ ConsumerApp (streaming, micro-batch 10s)
    ├─ filter num_boxes>0 + quality_flag + processed_at
@@ -69,6 +76,8 @@ hdfs:///project/raw/                <- parquet, schema preprocessedSchema
    └─ window(1min) groupBy split, bbox_size_category
            ▼
       hdfs:///project/processed/aggregates/  (append, checkpoint/aggregates/)
+        │
+        ▼ streamlit/app.py (lecture seule, charts/filtres/tables)
 ```
 
 ## Structure des dossiers
@@ -81,6 +90,7 @@ plate-detection-spark/
 │   ├── producer/   ← Batch : images+labels YOLO -> letterbox -> raw/
 │   ├── consumer/   ← Streaming : raw/ -> filtre/enrichit -> processed/
 │   ├── common/     ← Schémas, chemins HDFS, prétraitement image
+│   ├── streamlit/app.py ← Dashboard visu uniquement <- processed/
 │   └── build.sbt
 │
 ├── 2-model-training/              ← Microservice 2 : Entraînement (PyTorch)

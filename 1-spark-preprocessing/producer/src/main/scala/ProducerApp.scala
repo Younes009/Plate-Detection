@@ -19,6 +19,8 @@ object ProducerApp {
       .appName("PlateDetection-Producer-Batch")
       .getOrCreate()
 
+    import spark.implicits._
+
     // Chemin du dataset (HDFS ou local). Par défaut hdfs:///project/staging/dataset
     // Structure attendue : <datasetPath>/{train,valid,test}/{images,labels}/
     val datasetPath = if (args.nonEmpty) args(0) else HdfsPaths.STAGING + "dataset"
@@ -38,7 +40,8 @@ object ProducerApp {
         col("content").as("raw_content")
       )
 
-    println(s"Images chargées : ${dfImages.count()}")
+    val nbImages = dfImages.count()
+    println(s"Images chargées : $nbImages")
 
     // --- 2. Lecture et parsing des labels YOLO (class_id cx cy w h) ---
     val labelPaths = splits.map(s => s"$datasetPath/$s/labels/*.txt")
@@ -104,7 +107,8 @@ object ProducerApp {
       .withColumn("ingested_at", current_timestamp())
       .select(Schemas.preprocessedSchema.fieldNames.map(col): _*)
 
-    println(s"Lignes après prétraitement : ${dfFinal.count()}")
+    val nbRows = dfFinal.count()
+    println(s"Lignes après prétraitement : $nbRows")
 
     // --- 8. Écriture unique en Parquet vers HDFS ---
     dfFinal.write
@@ -113,7 +117,14 @@ object ProducerApp {
 
     println(s"Données écrites dans ${HdfsPaths.RAW}")
 
-    // --- 9. Arrêt (batch unique, pas de boucle) ---
+    // --- 9. Log d'exécution (hdfs:///project/logs/) ---
+    Seq((java.time.Instant.now().toString, datasetPath, nbImages, nbRows))
+      .toDF("run_at", "dataset_path", "nb_images", "nb_rows")
+      .write.mode("append").parquet(HdfsPaths.LOGS + "producer/")
+
+    println(s"Log d'exécution écrit dans ${HdfsPaths.LOGS}producer/")
+
+    // --- 10. Arrêt (batch unique, pas de boucle) ---
     spark.stop()
   }
 }

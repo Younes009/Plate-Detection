@@ -6,7 +6,8 @@
 ├── build.sbt
 ├── common/src/main/scala/Utils.scala      # paths HDFS, schema, letterbox resize, features
 ├── producer/src/main/scala/ProducerApp.scala   # batch -> raw/
-└── consumer/src/main/scala/ConsumerApp.scala   # streaming raw/ -> processed/
+├── consumer/src/main/scala/ConsumerApp.scala   # streaming raw/ -> processed/
+└── streamlit/app.py                       # dashboard visu uniquement <- processed/
 ```
 
 ## HDFS
@@ -14,7 +15,7 @@
 hdfs:///project/staging/dataset/   # dataset source (train|valid|test)/(images|labels)
 hdfs:///project/raw/               # sortie producer (parquet)
 hdfs:///project/processed/         # sortie consumer (parquet, append)
-hdfs:///project/logs/
+hdfs:///project/logs/producer/     # log d'exécution producer (parquet, append)
 hdfs:///project/checkpoint/        # checkpoints streaming
 ```
 
@@ -68,3 +69,15 @@ spark-submit --class ConsumerApp --master yarn \
 ## Flux de données
 1. **Producer** lit images + labels YOLO du dataset, letterbox resize 256x256, reprojette les bbox, calcule les features, écrit une fois en Parquet dans `raw/`, s'arrête.
 2. **Consumer** détecte les nouveaux fichiers Parquet dans `raw/` (micro-batch toutes les 10s), filtre + enrichit (`quality_flag`), écrit en append dans `processed/`, et maintient en parallèle des agrégats fenêtrés dans `processed/aggregates/`. Tourne indéfiniment via `awaitAnyTermination()`.
+3. **Streamlit** (`streamlit/app.py`) lit uniquement `processed/` et `processed/aggregates/` (parquet) : aucun calcul métier, uniquement charts/filtres/tables.
+
+## Dashboard (visualisation uniquement)
+```bash
+cd 1-spark-preprocessing/streamlit
+pip install -r requirements.txt
+streamlit run app.py
+```
+- Lit `hdfs:///project/processed/` (table par bbox) et `hdfs:///project/processed/aggregates/` (agrégats fenêtrés).
+- Filtres : `split`, `bbox_size_category`, `quality_flag`.
+- Charts : répartition par taille de bbox, quality_flag, quadrants, distribution `aspect_ratio`, série temporelle des agrégats.
+- Aucun calcul de scoring/ML, aucune écriture : lecture seule de `processed/`.

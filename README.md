@@ -18,6 +18,7 @@ Projet Spark Core/
 │   │                  features bbox, écriture unique -> hdfs:///project/raw/
 │   ├── consumer/   ← Streaming : readStream raw/ -> filtre/enrichit -> processed/
 │   ├── common/     ← Schémas, chemins HDFS, prétraitement image
+│   ├── streamlit/app.py ← Dashboard visu uniquement (lit processed/)
 │   └── build.sbt
 │
 ├── 2-model-training/             ← Microservice 2 : Entraînement (PyTorch)
@@ -55,6 +56,9 @@ spark-submit --class ProducerApp --master yarn \
 # Consumer (streaming, tourne en continu) -> hdfs:///project/processed/
 spark-submit --class ConsumerApp --master yarn \
   consumer/target/scala-2.12/consumer-assembly-0.1.0.jar
+
+# Dashboard (visu uniquement, lit hdfs:///project/processed/)
+cd streamlit && pip install -r requirements.txt && streamlit run app.py
 ```
 Voir `1-spark-preprocessing/README.md` pour le détail.
 
