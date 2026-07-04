@@ -12,16 +12,18 @@ object HdfsPaths {
 
 object Schemas {
 
-  // Schema écrit par le Producer dans DEST/ — images brutes, pas de transformation
+  // Schema écrit par le Producer (images brutes + labels YOLO)
   val destSchema: StructType = StructType(Seq(
     StructField("image_name",  StringType,    nullable = false),
     StructField("split",       StringType,    nullable = false),
     StructField("image_path",  StringType,    nullable = false),
     StructField("image_data",  BinaryType,    nullable = false),
+    StructField("label_path",  StringType,    nullable = true),
+    StructField("label_data",  StringType,    nullable = true),   // contenu YOLO: "class cx cy w h\n..."
     StructField("ingested_at", TimestampType, nullable = false)
   ))
 
-  // Schema écrit par le Consumer dans OUTPUT/ (destSchema + scoring)
+  // Schema écrit par le Consumer (destSchema + scoring)
   val outputSchema: StructType = destSchema
     .add(StructField("prediction",       StringType,    nullable = true))
     .add(StructField("confidence_score", DoubleType,    nullable = true))

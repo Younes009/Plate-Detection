@@ -38,7 +38,6 @@ object ConsumerApp {
     val modelPathNorm = modelPath.stripSuffix("/").stripSuffix("\\") + java.io.File.separator
     ModelLoader.initialize(spark, modelPathNorm)
 
-    // --- Lecture en streaming depuis DEST/ ---
     // recursiveFileLookup=true : bypass partition discovery sur batch_N_TS/
     val rawStream = spark.readStream
       .schema(Schemas.destSchema)
@@ -48,7 +47,6 @@ object ConsumerApp {
 
     val enriched = rawStream.withColumn("processed_at", current_timestamp())
 
-    // --- foreachBatch : scoring + double écriture ---
     val query = enriched.writeStream
       .foreachBatch { (batchDF: DataFrame, batchId: Long) =>
         if (!batchDF.isEmpty) {
@@ -62,7 +60,8 @@ object ConsumerApp {
             .option("compression", "snappy")
             .parquet(outputPath)
 
-          toWrite.select("image_path", "prediction", "confidence_score", "processed_at")
+          // Prédictions + ground truth YOLO pour évaluation
+          toWrite.select("image_path", "prediction", "confidence_score", "processed_at", "label_data")
             .write
             .mode("append")
             .option("compression", "snappy")
