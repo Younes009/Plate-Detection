@@ -5,24 +5,14 @@ import org.apache.hadoop.fs.{FileSystem, Path}
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.functions._
 
-import scala.util.Try
-
 /**
- *
  * Microservice 1 — Producer BATCH (Spark Core + Scala).
  *
  * Args : [sourcePath] [destPath] [batchSize] [intervalSeconds]
  *
- * Logique :
- *   1. Parcourt récursivement sourcePath pour lister toutes les images (JPEG/PNG)
- *   2. Découpe en batches de batchSize
- *   3. Pour chaque batch :
- *        - Lit images via binaryFile
- *        - Dérive le chemin du label YOLO (/images/ → /labels/, .jpg → .txt)
- *        - Lit le contenu du label si présent (sinon null)
- *        - Écrit Parquet Snappy dans destPath/batch_N_TS/
- *   4. Attend intervalSeconds entre chaque batch
- *   5. Arrêt automatique après le dernier batch
+ * Lit les images JPEG/PNG depuis sourcePath de façon récursive,
+ * découpe en batches, écrit chaque batch en Parquet Snappy dans destPath/batch_N_TS/.
+ * Aucune transformation, aucune jointure — images brutes uniquement.
  */
 object ProducerApp {
 
@@ -65,24 +55,6 @@ object ProducerApp {
       return
     }
 
-    // image URI (file:///path/images/foo.jpg) → label URI (file:///path/labels/foo.txt)
-    val toLabelUri = udf { imgUri: String =>
-      if (imgUri == null) null
-      else imgUri
-        .replaceAll("(?i)/images/", "/labels/")
-        .replaceAll("(?i)\\.(jpg|jpeg|png)$", ".txt")
-    }
-
-    // Lit le fichier texte pointé par un URI file:/// — null si absent
-    val readLabel = udf { labelUri: String =>
-      if (labelUri == null) null
-      else Try {
-        val file = new java.io.File(new java.net.URI(labelUri))
-        if (file.exists()) new String(java.nio.file.Files.readAllBytes(file.toPath), "UTF-8")
-        else null
-      }.getOrElse(null): String
-    }
-
     val batches = allImages.grouped(batchSize).toSeq
 
     batches.zipWithIndex.foreach { case (batchPaths, idx) =>
@@ -100,15 +72,11 @@ object ProducerApp {
                regexp_extract(col("path"), "/(train|valid|test)/", 1))
           .otherwise(lit("unknown")))
         .withColumn("ingested_at", current_timestamp())
-        .withColumn("label_path", toLabelUri(col("path")))
-        .withColumn("label_data",  readLabel(col("label_path")))
         .select(
           col("image_name"),
           col("split"),
           col("path").as("image_path"),
           col("content").as("image_data"),
-          col("label_path"),
-          col("label_data"),
           col("ingested_at")
         )
         .write
