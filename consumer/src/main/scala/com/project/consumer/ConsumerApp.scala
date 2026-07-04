@@ -23,10 +23,10 @@ import org.apache.spark.sql.streaming.Trigger
 object ConsumerApp {
 
   def main(args: Array[String]): Unit = {
-    val destPath       = if (args.length > 0) args(0) else HdfsPaths.DEST
-    val outputPath     = if (args.length > 1) args(1) else HdfsPaths.OUTPUT
-    val modelPath      = if (args.length > 2) args(2) else HdfsPaths.MODELS
-    val checkpointPath = if (args.length > 3) args(3) else HdfsPaths.CHECKPOINT
+    val destPath       = if (args.length > 0) args(0) else "data/dest"
+    val outputPath     = if (args.length > 1) args(1) else "data/output"
+    val modelPath      = if (args.length > 2) args(2) else "data/models"
+    val checkpointPath = if (args.length > 3) args(3) else "data/checkpoint"
 
     val outputPredictions = outputPath.stripSuffix("/").stripSuffix("\\") +
                             java.io.File.separator + "predictions" + java.io.File.separator

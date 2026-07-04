@@ -44,8 +44,8 @@ object ProducerApp {
   }
 
   def main(args: Array[String]): Unit = {
-    val sourcePath      = if (args.length > 0) args(0) else HdfsPaths.SOURCE
-    val destPath        = if (args.length > 1) args(1) else HdfsPaths.DEST
+    val sourcePath      = if (args.length > 0) args(0) else "license-plate-detection-dataset-10125-images"
+    val destPath        = if (args.length > 1) args(1) else "data/dest"
     val batchSize       = if (args.length > 2) args(2).toInt  else 100
     val intervalSeconds = if (args.length > 3) args(3).toLong else 0L
 
