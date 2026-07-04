@@ -42,7 +42,6 @@ object ModelLoader {
   private val SKLEARN_ONNX_FILE = "plate_model.onnx"
   private val MLLIB_DIR         = "spark_model"
 
-  // Features pour le modèle sklearn (doivent correspondre à train_model.py)
   val FEATURE_COLS: Array[String] = Array(
     "bbox_area_norm", "aspect_ratio", "cx_norm", "cy_norm", "w_norm", "h_norm"
   )
@@ -231,21 +230,7 @@ object ModelLoader {
   //
   // Plaque EU typique : ratio largeur/hauteur ≈ 3.1 (520×110 mm).
 
-  def scoreSimulated(df: DataFrame): DataFrame = {
-    val idealRatio = lit(3.1)
-    val ratioScore = lit(1.0) - least(abs(col("aspect_ratio") - idealRatio) / idealRatio, lit(1.0))
-    val areaScore  = when(col("bbox_area_norm").isNull, lit(0.0))
-                       .otherwise(least(col("bbox_area_norm") * lit(20.0), lit(1.0)))
-    val qualScore  = when(col("quality_flag") === "OK", lit(1.0)).otherwise(lit(0.4))
-    val rawScore   = ratioScore * lit(0.5) + areaScore * lit(0.3) + qualScore * lit(0.2)
-    val confidence = when(col("num_boxes") > 0,
-                       greatest(least(rawScore, lit(0.99)), lit(0.05))
-                     ).otherwise(lit(0.0))
-
-    df.withColumn("confidence_score", confidence)
-      .withColumn("prediction",
-        when(col("num_boxes") <= 0,   lit("background"))
-          .when(confidence >= 0.5,    lit("plate"))
-          .otherwise(lit("uncertain")))
-  }
+  def scoreSimulated(df: DataFrame): DataFrame =
+    df.withColumn("confidence_score", lit(0.5))
+      .withColumn("prediction", lit("uncertain"))
 }
