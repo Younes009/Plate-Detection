@@ -1,18 +1,23 @@
-ThisBuild / scalaVersion := "2.12.18"
-ThisBuild / version := "0.1.0"
+ThisBuild / scalaVersion := "2.13.14"
+ThisBuild / version      := "0.1.0"
 
-val sparkVersion = "3.5.1"
+val sparkVersion       = "4.1.1"
+val onnxRuntimeVersion = "1.18.0"
 
 lazy val commonSettings = Seq(
   libraryDependencies ++= Seq(
     "org.apache.spark" %% "spark-core"  % sparkVersion % "provided",
     "org.apache.spark" %% "spark-sql"   % sparkVersion % "provided",
     "org.apache.spark" %% "spark-mllib" % sparkVersion % "provided",
-    "org.scala-lang.modules" %% "scala-xml" % "2.1.0"
+    "org.scala-lang.modules" %% "scala-xml" % "2.3.0"
   ),
   assembly / assemblyMergeStrategy := {
-    case PathList("META-INF", xs @ _*) => MergeStrategy.discard
-    case _ => MergeStrategy.first
+    case PathList("META-INF", "MANIFEST.MF")          => MergeStrategy.discard
+    case PathList("META-INF", "native-image", _*)     => MergeStrategy.discard
+    case PathList("META-INF", xs @ _*)                => MergeStrategy.discard
+    case x if x.endsWith(".proto")                    => MergeStrategy.first
+    case x if x.endsWith(".so") || x.endsWith(".dll") => MergeStrategy.first
+    case _                                            => MergeStrategy.first
   }
 )
 
@@ -23,7 +28,10 @@ lazy val common = (project in file("common"))
 lazy val ml = (project in file("ml"))
   .dependsOn(common)
   .settings(commonSettings)
-  .settings(name := "ml")
+  .settings(
+    name := "ml",
+    libraryDependencies += "com.microsoft.onnxruntime" % "onnxruntime" % onnxRuntimeVersion
+  )
 
 lazy val producer = (project in file("producer"))
   .dependsOn(common)
@@ -38,7 +46,8 @@ lazy val consumer = (project in file("consumer"))
   .settings(commonSettings)
   .settings(
     name := "consumer",
-    assembly / mainClass := Some("com.project.consumer.ConsumerApp")
+    assembly / mainClass := Some("com.project.consumer.ConsumerApp"),
+    libraryDependencies += "com.microsoft.onnxruntime" % "onnxruntime" % onnxRuntimeVersion
   )
 
 lazy val root = (project in file("."))
