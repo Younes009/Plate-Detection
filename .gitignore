@@ -66,6 +66,9 @@ Thumbs.db
 .idea/
 *.swp
 
+# Claude Code
+.claude/
+
 # Model outputs / checkpoints
 #checkpoints/
 saved_model/
