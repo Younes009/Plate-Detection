@@ -1,101 +1,184 @@
-# Architecture & Flux — License Plate Detection
+# Architecture — Plate Detection Spark Pipeline
 
 ## Vue d'ensemble
 
 ```
-hdfs:///project/staging/dataset/
-        (train|valid|test)/(images|labels) — YOLO .txt, COCO .json, ou Pascal VOC .xml
-                │
+Dataset  ──batch──▶  data/dest/  ──stream──▶  data/output/  ──read──▶  Dashboard
+(disk)    Producer    (Parquet)    Consumer     (Parquet)     Streamlit   (UI)
+```
+
+---
+
+## Schéma détaillé
+
+```
+╔══════════════════════════════════════════════════════════════════════════╗
+║                   PLATE DETECTION — ARCHITECTURE                         ║
+╚══════════════════════════════════════════════════════════════════════════╝
+
+  LICENSE PLATE DATASET
+  ┌─────────────────────────────────┐
+  │  train/images/*.jpg  (7 057)    │
+  │  train/labels/*.txt  (7 057)    │
+  │  valid/images/*.jpg  (2 048)    │   YOLO format:
+  │  valid/labels/*.txt  (2 048)    │   "0 cx cy w h\n..."
+  │  test/images/*.jpg   (1 020)    │   1 classe : license-plate
+  │  test/labels/*.txt   (1 020)    │
+  └─────────────┬───────────────────┘
+                │ listImages() récursif
                 ▼
-┌──────────────────────────────────────────────────────────┐
-│ Pipeline Spark (Scala, packages com.project.*, HDFS)      │
-│                                                            │
-│  ProducerApp (batch, 1x)            com.project.producer  │
-│   - lit images + annotations (YOLO/COCO/Pascal VOC)       │
-│   - letterbox resize 256x256, reprojette bbox             │
-│   - calcule features (aire, ratio, quadrants, num_boxes)  │
-│   - write parquet (snappy) -> hdfs:///project/raw/        │
-│   - log run -> hdfs:///project/logs/producer/             │
-│   - spark.stop()                                          │
-│                                                            │
-│  ModelLoader                        com.project.ml        │
-│   - PipelineModel MLlib (hdfs:///project/models/...)      │
-│     si dispo, sinon scoring simulé réaliste               │
-│   - ajoute prediction + confidence_score                  │
-│                                                            │
-│  ConsumerApp (streaming, infini)    com.project.consumer  │
-│   - readStream raw/ (parquet, schéma explicite)           │
-│   - filter num_boxes>0, ajoute quality_flag, processed_at │
-│   - ModelLoader.score() -> prediction, confidence_score   │
-│   - double écriture (append) :                            │
-│       processed/             (flux enrichi complet)       │
-│       processed/predictions/ (image_path,prediction,...)  │
-│   - checkpoint/processed/, checkpoint/predictions/        │
-│   - awaitAnyTermination() (exactly-once)                  │
-│                                                            │
-│  streamlit/app.py (lecture seule)                         │
-│   - lit processed/ + processed/predictions/               │
-│   - KPIs, charts, histogramme confidence, filtres, refresh│
-└──────────────────────────────────────────────────────────┘
+╔══════════════════════════════════╗
+║  MICROSERVICE 1 — PRODUCER       ║  Spark Core (Batch)
+║  ProducerApp.scala               ║  spark-submit --master local[2]
+╠══════════════════════════════════╣
+║  1. Liste toutes les images      ║
+║  2. Groupe par batchSize (200)   ║
+║  3. spark.read.format(binaryFile)║
+║  4. Extrait image_name, split    ║  ← AUCUNE TRANSFORMATION
+║  5. Écrit Parquet Snappy         ║  ← IMAGES BRUTES UNIQUEMENT
+║  6. Sleep(intervalSeconds)       ║
+║  7. Batch suivant → stop à fin   ║
+╠══════════════════════════════════╣
+║  Schema écrit (destSchema) :     ║
+║  image_name | split              ║
+║  image_path | image_data (bytes) ║
+║  ingested_at                     ║
+╚══════════════╤═══════════════════╝
+               │ Parquet Snappy
+               │ batch par batch (goute à goute)
+               ▼
+  ┌────────────────────────────────┐
+  │         data/dest/             │
+  │   batch_0_<ts>/  *.parquet     │
+  │   batch_1_<ts>/  *.parquet     │  ← Structured Streaming source
+  │   batch_N_<ts>/  *.parquet     │    (recursiveFileLookup=true)
+  └────────────┬───────────────────┘
+               │ readStream (maxFilesPerTrigger=1)
+               │ trigger toutes les 10s
+               ▼
+╔══════════════════════════════════╗
+║  MICROSERVICE 2 — CONSUMER       ║  Spark Structured Streaming
+║  ConsumerApp.scala               ║  spark-submit --master local[2]
+╠══════════════════════════════════╣
+║  readStream (écoute permanente)  ║
+║  ┌── foreachBatch ─────────────┐ ║
+║  │ 1. Joint labels YOLO        │ ║  image_path → /labels/ → .txt
+║  │    image_path → label_path  │ ║  UDF readLabel(file:///...)
+║  │    → label_data (texte)     │ ║
+║  │ 2. ModelLoader.score()      │ ║──────────────────────┐
+║  │    prediction               │ ║                      │
+║  │    confidence_score         │ ║                      │
+║  │ 3. Écrit output/            │ ║                      │
+║  │ 4. Écrit output/predictions/│ ║                      │
+║  └─────────────────────────────┘ ║                      │
+║  awaitTermination()              ║                      │
+╚════════════════════════════════╤═╝                      │
+                                 │                        │
+              ┌──────────────────┘             ╔══════════╧══════════╗
+              │                                ║  ML MODULE          ║
+              ▼                                ║  ModelLoader.scala  ║
+  ┌───────────────────────────┐                ╠═════════════════════╣
+  │     data/output/          │                ║ 1. best_model.onnx  ║
+  │     *.parquet             │                ║    PyTorch → image  ║
+  │                           │                ║ 2. plate_model.onnx ║
+  │  image_name | split       │                ║    sklearn → bbox   ║
+  │  image_path | image_data  │                ║ 3. spark_model/     ║
+  │  label_path | label_data  │                ║    MLlib Pipeline   ║
+  │  prediction               │                ║ 4. simulé (fallback)║
+  │  confidence_score         │                ║    conf=0.5         ║
+  │  processed_at             │                ╚═════════════════════╝
+  │                           │
+  │  predictions/ *.parquet   │
+  │  image_path | label_data  │
+  │  prediction | conf_score  │
+  │  processed_at             │
+  └───────────┬───────────────┘
+              │ pandas + pyarrow (glob *.parquet)
+              │ cache TTL 60s
+              ▼
+╔══════════════════════════════════╗
+║  MICROSERVICE 3 — DASHBOARD      ║  Streamlit
+║  streamlit/app.py                ║  localhost:8501
+╠══════════════════════════════════╣
+║  Filtres : split / prediction    ║
+║            confidence / label    ║
+║                                  ║
+║  KPIs : images filtrées          ║
+║         images distinctes        ║
+║         confidence moyenne       ║
+║         images avec label YOLO   ║
+║                                  ║
+║  Charts : prédiction bar chart   ║
+║           split bar chart        ║
+║           distribution confiance ║
+║           stats bbox YOLO        ║
+║                                  ║
+║  Table : données enrichies       ║
+║  Detail : labels YOLO bruts      ║
+╚══════════════════════════════════╝
 ```
 
-## Flux détaillé (HDFS)
+---
 
-```
-hdfs:///project/staging/dataset/{train,valid,test}/{images,labels}
-   images : *.jpg|*.jpeg|*.png
-   labels : YOLO *.txt ("class_id cx cy w h") | Pascal VOC *.xml | COCO _annotations.coco.json
-        │
-        ▼ ProducerApp (batch)
-hdfs:///project/raw/                <- parquet (snappy), schema preprocessedSchema
-   image_name, split, image_path, label,
-   orig_width/height, image_data(256x256 jpg),
-   class_id, cx/cy/w/h_norm, x_min..y_max,
-   bbox_area(_norm), aspect_ratio,
-   bbox_size_category, center_x/y_quadrant,
-   num_boxes, ingested_at
+## Schemas des données
 
-hdfs:///project/logs/producer/      <- parquet append, 1 ligne/run
-   run_at, dataset_path, nb_images, nb_rows
-        │
-        ▼ ConsumerApp (streaming, micro-batch 10s)
-   filter num_boxes>0
-   + quality_flag (OK/TOO_SMALL/BAD_RATIO), processed_at
-   + ModelLoader.score() -> prediction, confidence_score
-        │
-        ├──▶ hdfs:///project/processed/              (append, checkpoint/processed/)
-        │       toutes les colonnes ci-dessus + quality_flag, processed_at,
-        │       prediction, confidence_score
-        │
-        └──▶ hdfs:///project/processed/predictions/  (append, checkpoint/predictions/)
-                image_path, prediction, confidence_score
-        │
-        ▼ streamlit/app.py (lecture seule)
-   KPIs, charts (label/prediction/bbox_size/quality_flag),
-   histogramme confidence_score, filtres (split/label/quality/confidence), refresh
-```
+### destSchema — écrit par le Producer
 
-## Structure des dossiers
+| Colonne | Type | Description |
+|---|---|---|
+| `image_name` | String | Nom du fichier sans extension |
+| `split` | String | `train` / `valid` / `test` / `unknown` |
+| `image_path` | String | URI complète du fichier image |
+| `image_data` | Binary | Contenu brut JPEG/PNG |
+| `ingested_at` | Timestamp | Horodatage d'ingestion |
 
-```
-plate-detection-spark/
-├── build.sbt                                                   ← modules common, ml, producer, consumer (spark-mllib, scala-xml)
-├── common/src/main/scala/com/project/common/Utils.scala        ← schémas, chemins HDFS, prétraitement image, parsers YOLO/COCO/VOC
-├── ml/src/main/scala/com/project/ml/ModelLoader.scala          ← scoring ML (PipelineModel MLlib ou simulé)
-├── producer/src/main/scala/com/project/producer/ProducerApp.scala  ← Batch : images+annotations -> letterbox -> raw/
-├── consumer/src/main/scala/com/project/consumer/ConsumerApp.scala  ← Streaming : raw/ -> ML scoring -> processed/ + processed/predictions/
-└── streamlit/app.py                                             ← Dashboard lecture seule <- processed/, processed/predictions/
-```
+### outputSchema — écrit par le Consumer
 
-## HDFS structure (`.claude/prompt.md`)
+Tout le `destSchema` plus :
 
-```
-hdfs:///project/raw/
-hdfs:///project/processed/
-hdfs:///project/processed/predictions/
-hdfs:///project/staging/dataset/
-hdfs:///project/logs/producer/
-hdfs:///project/checkpoint/processed/
-hdfs:///project/checkpoint/predictions/
-hdfs:///project/models/plate_quality_model/   (optionnel, PipelineModel MLlib)
+| Colonne | Type | Description |
+|---|---|---|
+| `label_path` | String | URI du fichier `.txt` YOLO correspondant |
+| `label_data` | String | Contenu YOLO brut : `"0 cx cy w h\n..."` |
+| `prediction` | String | `plate` / `background` / `uncertain` |
+| `confidence_score` | Double | Score de confiance `[0.0, 1.0]` |
+| `processed_at` | Timestamp | Horodatage de traitement |
+
+---
+
+## Stack technique
+
+| Composant | Technologie | Version |
+|---|---|---|
+| Producer / Consumer | Scala + Apache Spark | 2.13.14 / 4.1.1 |
+| Build | sbt + sbt-assembly | 1.9.9 |
+| Runtime JVM | Java | 17 |
+| ML scoring | ONNX Runtime / MLlib | — |
+| Dashboard | Streamlit | 1.58 |
+| Lecture Parquet | pandas + pyarrow | 3.x |
+
+---
+
+## Lancement
+
+```bash
+# Pipeline complet
+python main.py
+
+# Sans rebuild
+python main.py --skip-build
+
+# Producer seul (depuis la racine du projet)
+spark-submit --master local[2] \
+  producer/target/scala-2.13/producer-assembly-0.1.0.jar \
+  license-plate-detection-dataset-10125-images \
+  data/dest 200 5
+
+# Consumer seul
+spark-submit --master local[2] \
+  consumer/target/scala-2.13/consumer-assembly-0.1.0.jar \
+  data/dest data/output data/models data/checkpoint
+
+# Dashboard seul
+python main.py --streamlit-only
 ```
