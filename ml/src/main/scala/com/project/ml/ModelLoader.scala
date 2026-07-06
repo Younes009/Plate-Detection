@@ -3,48 +3,38 @@ package com.project.ml
 import com.project.common.HdfsPaths
 import org.apache.hadoop.fs.Path
 import org.apache.spark.broadcast.Broadcast
-import org.apache.spark.ml.PipelineModel
-import org.apache.spark.ml.linalg.Vector
 import org.apache.spark.sql.{DataFrame, Row, SparkSession}
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.types._
 
+import java.awt.image.BufferedImage
 import java.io.ByteArrayInputStream
 import javax.imageio.ImageIO
 import scala.util.Try
 
 /**
- * Charge et applique un modèle de scoring (détection de plaques) au flux de données.
+ * Charge et applique le modèle de vision (détection de plaques) au flux d'images.
+ *
+ * Le scoring se fait DIRECTEMENT sur les octets de l'image (`image_data`) :
+ * aucun label, aucune feature bbox — le flux continu ne transporte que des
+ * images brutes.
  *
  * Priorité de chargement (première correspondance gagne) :
- *   1. best_model.onnx  — modèle PyTorch exporté en ONNX via ml/export_pytorch.py
- *                         Input  : "image_input" [batch, 3, 256, 256] float32 (ImageNet normalized)
- *                         Output : "output"       [batch, num_classes] float32
- *                         → scoreWithPytorchOnnx() : mapPartitions sur image_data (JPEG 256×256)
+ *   1. best_model.onnx  — CNN PyTorch exporté via ml/export_pytorch.py
+ *                         Input : "image_input" [batch, 3, 256, 256] (ImageNet normalized)
+ *   2. plate_model.onnx — classifieur sklearn entraîné par ml/train_model.py
+ *                         sur les pixels réduits (S×S RGB, aplati CHW, /255).
+ *                         Input : "float_input" [batch, 3*S*S] — S est DÉDUIT
+ *                         de la forme d'entrée du modèle, pas codé en dur.
+ *   3. (aucun fichier)  — fallback neutre (prediction=uncertain, confidence=0.5)
  *
- *   2. plate_model.onnx — modèle sklearn RandomForest exporté via ml/train_model.py
- *                         Input  : "float_input" [batch, 6] float32 (features bbox)
- *                         Output : "output_label" + "output_probability" (zipmap=False)
- *                         → scoreWithSklearnOnnx() : mapPartitions sur bbox features
- *
- *   3. spark_model/     — Spark MLlib PipelineModel
- *                         → scoreWithMllib()
- *
- *   4. (aucun fichier)  — heuristique géométrique (ratio bbox ≈ 3.1, area, quality_flag)
- *                         → scoreSimulated()
- *
- * Appeler initialize() depuis le driver avant de démarrer le streaming.
- * Appeler score(df) dans chaque foreachBatch — colonnes ajoutées : prediction + confidence_score.
+ * Le fichier ONNX est broadcasté une fois depuis le driver (initialize()) ;
+ * chaque partition ouvre UNE session ONNX Runtime, la ferme après consommation.
  */
 object ModelLoader {
 
   private val PYTORCH_ONNX_FILE = "best_model.onnx"
   private val SKLEARN_ONNX_FILE = "plate_model.onnx"
-  private val MLLIB_DIR         = "spark_model"
-
-  val FEATURE_COLS: Array[String] = Array(
-    "bbox_area_norm", "aspect_ratio", "cx_norm", "cy_norm", "w_norm", "h_norm"
-  )
 
   // Normalisation ImageNet (doit correspondre à export_pytorch.py)
   private val IMG_MEAN = Array(0.485f, 0.456f, 0.406f)
@@ -52,30 +42,23 @@ object ModelLoader {
 
   @transient private var broadcastPytorchOnnx: Option[Broadcast[Array[Byte]]] = None
   @transient private var broadcastSklearnOnnx: Option[Broadcast[Array[Byte]]] = None
-  @transient private var mllibModel: Option[PipelineModel]                    = None
 
   def initialize(spark: SparkSession, modelPath: String = HdfsPaths.MODELS): Unit = {
     val base = modelPath.stripSuffix("/").stripSuffix("\\") + java.io.File.separator
     broadcastPytorchOnnx = tryBroadcast(spark, base + PYTORCH_ONNX_FILE)
     broadcastSklearnOnnx = tryBroadcast(spark, base + SKLEARN_ONNX_FILE)
-    if (broadcastPytorchOnnx.isEmpty && broadcastSklearnOnnx.isEmpty)
-      mllibModel = Try(PipelineModel.load(base + MLLIB_DIR)).toOption
 
     val mode = if (broadcastPytorchOnnx.isDefined) s"PyTorch ONNX ($PYTORCH_ONNX_FILE)"
-               else if (broadcastSklearnOnnx.isDefined) s"Sklearn ONNX ($SKLEARN_ONNX_FILE)"
-               else if (mllibModel.isDefined) "Spark MLlib PipelineModel"
-               else "simulé (heuristique géométrique)"
+               else if (broadcastSklearnOnnx.isDefined) s"Sklearn ONNX pixels ($SKLEARN_ONNX_FILE)"
+               else "fallback neutre (aucun modèle dans MODEL/)"
     println(s"[ModelLoader] Mode actif : $mode")
   }
 
   def score(df: DataFrame): DataFrame = broadcastPytorchOnnx match {
     case Some(bc) => scoreWithPytorchOnnx(df, bc)
-    case None     => broadcastSklearnOnnx match {
-      case Some(bc) => scoreWithSklearnOnnx(df, bc)
-      case None     => mllibModel match {
-        case Some(m) => scoreWithMllib(m, df)
-        case None    => scoreSimulated(df)
-      }
+    case None => broadcastSklearnOnnx match {
+      case Some(bc) => scoreWithSklearnPixels(df, bc)
+      case None     => scoreFallback(df)
     }
   }
 
@@ -95,17 +78,15 @@ object ModelLoader {
       spark.sparkContext.broadcast(buf)
     }.toOption
 
-  // ─── 1. Scoring PyTorch ONNX — image-based ──────────────────────────────────
-  //
-  // Entrée   : image_data (Array[Byte] — JPEG 256×256 letterboxé par le Producer)
-  // Sortie   : prédiction au niveau image (plate / background) + confidence [0,1]
-  // Pipeline : JPEG → CHW float32 → normalisation ImageNet → OnnxTensor [1,3,256,256] → inférence
+  private def withScoringSchema(df: DataFrame): StructType = df.schema
+    .add(StructField("prediction",       StringType, nullable = true))
+    .add(StructField("confidence_score", DoubleType, nullable = true))
+
+  // ─── 1. Scoring PyTorch ONNX — CNN [1,3,256,256] ────────────────────────────
 
   private def scoreWithPytorchOnnx(df: DataFrame, bc: Broadcast[Array[Byte]]): DataFrame = {
-    val spark = df.sparkSession
-    val outputSchema = df.schema
-      .add(StructField("prediction",       StringType, nullable = true))
-      .add(StructField("confidence_score", DoubleType, nullable = true))
+    val spark        = df.sparkSession
+    val outputSchema = withScoringSchema(df)
 
     val rdd = df.rdd.mapPartitions { rows =>
       val env     = ai.onnxruntime.OrtEnvironment.getEnvironment()
@@ -116,21 +97,22 @@ object ModelLoader {
           val imgBytes = row.getAs[Array[Byte]]("image_data")
           if (imgBytes == null || imgBytes.isEmpty) ("uncertain", 0.0)
           else {
-            val flat   = jpegToFloatCHW(imgBytes)
-            val tensor = ai.onnxruntime.OnnxTensor.createTensor(env, java.nio.FloatBuffer.wrap(flat), Array(1L, 3L, 256L, 256L))
+            val img    = resize(ImageIO.read(new ByteArrayInputStream(imgBytes)), 256)
+            val flat   = toFloatCHW(img, normalizeImageNet = true)
+            val tensor = ai.onnxruntime.OnnxTensor.createTensor(
+              env, java.nio.FloatBuffer.wrap(flat), Array(1L, 3L, 256L, 256L))
             val inputs = new java.util.HashMap[String, ai.onnxruntime.OnnxTensorLike]()
             inputs.put("image_input", tensor)
 
             val result = session.run(inputs)
             val raw    = result.get(0).getValue
-
             val rawProbs: Array[Float] = raw match {
               case a: Array[Array[Float]] => a(0)
               case a: Array[Float]        => a
               case _                      => Array(0.5f, 0.5f)
             }
             // Applique softmax si ce sont des logits (somme ≠ 1)
-            val probs = if (math.abs(rawProbs.sum - 1.0f) < 0.05f) rawProbs else softmax(rawProbs)
+            val probs      = if (math.abs(rawProbs.sum - 1.0f) < 0.05f) rawProbs else softmax(rawProbs)
             val confidence = if (probs.length >= 2) probs(1).toDouble else probs(0).toDouble
             val prediction = if (confidence >= 0.5) "plate" else "background"
 
@@ -148,9 +130,79 @@ object ModelLoader {
     spark.createDataFrame(rdd, outputSchema)
   }
 
-  // Décode un JPEG en tableau CHW float32 normalisé ImageNet (format attendu par le modèle PyTorch)
-  private def jpegToFloatCHW(bytes: Array[Byte]): Array[Float] = {
-    val img  = ImageIO.read(new ByteArrayInputStream(bytes))
+  // ─── 2. Scoring Sklearn ONNX — pixels réduits [1, 3*S*S] ────────────────────
+
+  private def scoreWithSklearnPixels(df: DataFrame, bc: Broadcast[Array[Byte]]): DataFrame = {
+    val spark        = df.sparkSession
+    val outputSchema = withScoringSchema(df)
+
+    val rdd = df.rdd.mapPartitions { rows =>
+      val env     = ai.onnxruntime.OrtEnvironment.getEnvironment()
+      val session = env.createSession(bc.value, new ai.onnxruntime.OrtSession.SessionOptions())
+
+      // Taille d'entrée déduite du modèle : [None, 3*S*S] → S
+      val inputInfo  = session.getInputInfo.values.iterator.next
+      val inputShape = inputInfo.getInfo.asInstanceOf[ai.onnxruntime.TensorInfo].getShape
+      val featureDim = inputShape(1).toInt
+      val side       = math.sqrt(featureDim / 3.0).round.toInt
+      require(3 * side * side == featureDim,
+        s"[ModelLoader] Forme d'entrée inattendue : $featureDim (attendu 3*S*S)")
+
+      val scoredRows = rows.map { row =>
+        val (pred, conf) = Try {
+          val imgBytes = row.getAs[Array[Byte]]("image_data")
+          if (imgBytes == null || imgBytes.isEmpty) ("uncertain", 0.0)
+          else {
+            val img    = resize(ImageIO.read(new ByteArrayInputStream(imgBytes)), side)
+            val flat   = toFloatCHW(img, normalizeImageNet = false) // /255, comme train_model.py
+            val tensor = ai.onnxruntime.OnnxTensor.createTensor(
+              env, java.nio.FloatBuffer.wrap(flat), Array(1L, featureDim.toLong))
+            val inputs = new java.util.HashMap[String, ai.onnxruntime.OnnxTensorLike]()
+            inputs.put("float_input", tensor)
+
+            val result = session.run(inputs)
+            // skl2onnx < 1.15 nomme les sorties output_label/output_probability,
+            // les versions récentes label/probabilities : on accepte les deux.
+            val label  = firstOutput(result, "output_label", "label")
+              .getValue.asInstanceOf[Array[Long]](0)
+            val probas = firstOutput(result, "output_probability", "probabilities")
+              .getValue.asInstanceOf[Array[Array[Float]]](0)
+            val confidence = if (probas.length >= 2) probas(1).toDouble else probas(0).toDouble
+
+            tensor.close()
+            result.close()
+            (if (label == 1L) "plate" else "background", confidence)
+          }
+        }.getOrElse(("uncertain", 0.0))
+
+        Row.fromSeq(row.toSeq ++ Seq(pred, conf))
+      }
+      scoredRows ++ { session.close(); Iterator.empty }
+    }
+    spark.createDataFrame(rdd, outputSchema)
+  }
+
+  private def firstOutput(result: ai.onnxruntime.OrtSession.Result,
+                          names: String*): ai.onnxruntime.OnnxValue =
+    names.iterator.map(result.get(_)).find(_.isPresent).map(_.get())
+      .getOrElse(throw new NoSuchElementException(
+        s"Sorties ONNX absentes : ${names.mkString(", ")}"))
+
+  // ─── Prétraitement image (partagé par les deux modes de scoring) ────────────
+
+  /** Redimensionne en S×S RGB (bilinéaire — cohérent avec PIL côté training). */
+  private def resize(src: BufferedImage, side: Int): BufferedImage = {
+    val out = new BufferedImage(side, side, BufferedImage.TYPE_INT_RGB)
+    val g   = out.createGraphics()
+    g.setRenderingHint(java.awt.RenderingHints.KEY_INTERPOLATION,
+                       java.awt.RenderingHints.VALUE_INTERPOLATION_BILINEAR)
+    g.drawImage(src, 0, 0, side, side, null)
+    g.dispose()
+    out
+  }
+
+  /** Image → tableau CHW float32, /255, normalisation ImageNet optionnelle. */
+  private def toFloatCHW(img: BufferedImage, normalizeImageNet: Boolean): Array[Float] = {
     val w    = img.getWidth
     val h    = img.getHeight
     val flat = new Array[Float](3 * h * w)
@@ -161,7 +213,8 @@ object ModelLoader {
         case 1 => ((rgb >> 8)  & 0xFF) / 255.0f
         case 2 => ((rgb)       & 0xFF) / 255.0f
       }
-      flat(c * h * w + y * w + x) = (px - IMG_MEAN(c)) / IMG_STD(c)
+      flat(c * h * w + y * w + x) =
+        if (normalizeImageNet) (px - IMG_MEAN(c)) / IMG_STD(c) else px
     }
     flat
   }
@@ -173,76 +226,9 @@ object ModelLoader {
     exps.map(_ / sum)
   }
 
-  // ─── 2. Scoring Sklearn ONNX — feature-based ────────────────────────────────
-  //
-  // Entrée   : 6 features bbox (bbox_area_norm, aspect_ratio, cx_norm, cy_norm, w_norm, h_norm)
-  // Sortie   : output_label (Long) + output_probability (Array[Array[Float]], zipmap=False)
+  // ─── 3. Fallback neutre (aucun modèle disponible) ───────────────────────────
 
-  private def firstOutput(result: ai.onnxruntime.OrtSession.Result,
-                          names: String*): ai.onnxruntime.OnnxValue =
-    names.iterator.map(result.get(_)).find(_.isPresent).map(_.get())
-      .getOrElse(throw new NoSuchElementException(
-        s"Sorties ONNX absentes : ${names.mkString(", ")}"))
-
-  private def scoreWithSklearnOnnx(df: DataFrame, bc: Broadcast[Array[Byte]]): DataFrame = {
-    val spark = df.sparkSession
-    val outputSchema = df.schema
-      .add(StructField("prediction",       StringType, nullable = true))
-      .add(StructField("confidence_score", DoubleType, nullable = true))
-
-    val rdd = df.rdd.mapPartitions { rows =>
-      val env     = ai.onnxruntime.OrtEnvironment.getEnvironment()
-      val session = env.createSession(bc.value, new ai.onnxruntime.OrtSession.SessionOptions())
-
-      val scoredRows = rows.map { row =>
-        val (pred, conf) = Try {
-          val features: Array[Float] = FEATURE_COLS.map { colName =>
-            val idx = row.fieldIndex(colName)
-            if (row.isNullAt(idx)) 0.0f else row.getDouble(idx).toFloat
-          }
-          val tensor = ai.onnxruntime.OnnxTensor.createTensor(
-            env, java.nio.FloatBuffer.wrap(features), Array(1L, features.length.toLong))
-          val inputs = new java.util.HashMap[String, ai.onnxruntime.OnnxTensorLike]()
-          inputs.put("float_input", tensor)
-
-          val result = session.run(inputs)
-          // skl2onnx < 1.15 nomme les sorties output_label/output_probability,
-          // les versions récentes label/probabilities : on accepte les deux.
-          val label  = firstOutput(result, "output_label", "label").getValue.asInstanceOf[Array[Long]](0)
-          val probas = firstOutput(result, "output_probability", "probabilities").getValue.asInstanceOf[Array[Array[Float]]](0)
-          val confidence = if (probas.length >= 2) probas(1).toDouble else probas(0).toDouble
-
-          tensor.close()
-          result.close()
-          val prediction = if (label == 1L) "plate" else "background"
-          (prediction, confidence)
-        }.getOrElse(("uncertain", 0.5))
-
-        Row.fromSeq(row.toSeq ++ Seq(pred, conf))
-      }
-      // Ferme la session ONNX une fois la partition entièrement consommée
-      scoredRows ++ { session.close(); Iterator.empty }
-    }
-    spark.createDataFrame(rdd, outputSchema)
-  }
-
-  // ─── 3. Scoring MLlib PipelineModel ─────────────────────────────────────────
-
-  private val vectorHead: org.apache.spark.sql.expressions.UserDefinedFunction =
-    udf((v: Vector) => if (v.size > 1) v(1) else v(0))
-
-  private def scoreWithMllib(model: PipelineModel, df: DataFrame): DataFrame =
-    model.transform(df)
-      .withColumn("confidence_score", vectorHead(col("probability")))
-      .withColumn("prediction",
-        when(col("prediction") === 1.0, lit("plate")).otherwise(lit("background")))
-      .drop("probability", "rawPrediction")
-
-  // ─── 4. Scoring simulé (fallback heuristique) ────────────────────────────────
-  //
-  // Plaque EU typique : ratio largeur/hauteur ≈ 3.1 (520×110 mm).
-
-  def scoreSimulated(df: DataFrame): DataFrame =
+  def scoreFallback(df: DataFrame): DataFrame =
     df.withColumn("confidence_score", lit(0.5))
       .withColumn("prediction", lit("uncertain"))
 }

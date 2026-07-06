@@ -2,102 +2,50 @@ package com.project.consumer
 
 import com.project.common.Schemas
 import com.project.ml.ModelLoader
-import org.apache.hadoop.conf.Configuration
-import org.apache.hadoop.fs.Path
 import org.apache.spark.sql.{DataFrame, SparkSession}
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.streaming.Trigger
-
-import scala.util.Try
 
 /**
  * Microservice 2 — Consumer & Predictor (Spark Structured Streaming + Scala).
  *
  * Args : [ingressPath] [stagingPath] [outputPath] [modelPath] [checkpointPath]
  *
- * ingressPath = DEST/continuous_ingress/ UNIQUEMENT : le flux d'inférence est
- * étanche vis-à-vis de DEST/ml_dataset/ (copie hebdo lue par le service ML),
- * qui ne doit JAMAIS entrer dans le moteur de streaming.
+ * Tourne EN PERMANENCE (awaitTermination, checkpoint exactly-once) — c'est le
+ * seul service permanent du pipeline. Structured Streaming natif : aucun
+ * DStream, aucune boucle manuelle.
+ *
+ * Il écoute EXCLUSIVEMENT DEST/continuous_ingress/ : des images brutes, sans
+ * aucun label YOLO (les labels n'existent que dans ml_dataset, consommé par le
+ * service ML Python — jamais par le stream). Aucune recherche de fichier .txt.
  *
  * Ordre STRICT des étapes, dans chaque micro-batch :
  *   1. FETCH      : readStream binaryFile sur DEST/continuous_ingress/
  *   2. PARSE +
- *      TRANSFORM  : nom / split / label YOLO → colonnes typées + features bbox
- *   3. WRITE (4)  : écriture immédiate des données propres dans STAGING/
- *                   (couche lue par le service ML Python — READ 5)
- *   4. PREDICT    : modèle ONNX/MLlib injecté via ModelLoader → prediction + score
- *   5. WRITE      : résultats enrichis dans OUTPUT/ (lus par Streamlit — READ 8)
- *
- * awaitTermination() : écoute permanente, exactly-once garanti par le checkpoint.
- * Pas de boucle manuelle, pas de DStream — Structured Streaming natif uniquement.
+ *      TRANSFORM  : nettoyage (filtre images valides) + typage des colonnes
+ *   3. WRITE      : écriture immédiate des images propres dans STAGING/
+ *                   (Parquet — couche d'historique)
+ *   4. PREDICT    : modèle de vision ONNX broadcasté (injecté au démarrage),
+ *                   scoring DIRECTEMENT sur les octets de l'image
+ *   5. WRITE      : résultat final + confidence_score dans OUTPUT/
  */
 object ConsumerApp {
 
-  // image URI (…/images/foo.jpg) → label URI (…/labels/foo.txt)
-  private val toLabelUri = udf { imgUri: String =>
-    if (imgUri == null) null
-    else imgUri
-      .replaceAll("(?i)/images/", "/labels/")
-      .replaceAll("(?i)\\.(jpg|jpeg|png)$", ".txt")
-  }
-
-  // Lit le contenu du label via l'API Hadoop FS (fonctionne en local ET sur HDFS) — null si absent
-  private val readLabel = udf { labelUri: String =>
-    if (labelUri == null) null
-    else Try {
-      val p  = new Path(labelUri)
-      val fs = p.getFileSystem(new Configuration())
-      if (!fs.exists(p)) null
-      else {
-        val in = fs.open(p)
-        try new String(org.apache.commons.io.IOUtils.toByteArray(in), "UTF-8")
-        finally in.close()
-      }
-    }.getOrElse(null): String
-  }
-
   /**
-   * PARSE & TRANSFORM : nettoie, type et enrichit le flux brut binaryFile.
-   * Une ligne par bounding box YOLO (explode_outer garde les images sans label).
-   * Produit exactement Schemas.stagingSchema.
+   * PARSE & TRANSFORM : nettoie et type le flux brut binaryFile.
+   * Produit exactement Schemas.stagingSchema — une ligne par image propre.
    */
-  private def parseAndTransform(raw: DataFrame): DataFrame = {
-    val yoloField = (i: Int) =>
-      when(size(col("yolo_tokens")) >= 5, element_at(col("yolo_tokens"), i))
-
+  private def parseAndTransform(raw: DataFrame): DataFrame =
     raw
-      .where(col("path").rlike("(?i)\\.(jpg|jpeg|png)$")) // ignore les .txt copiés dans DEST
-      .withColumn("image_name",
-        regexp_extract(col("path"), "(?i)([^/\\\\]+)\\.(jpg|jpeg|png)$", 1))
-      .withColumn("split",
-        when(col("path").rlike("[/\\\\](train|valid|val|test)[/\\\\]"),
-             regexp_extract(col("path"), "[/\\\\](train|valid|val|test)[/\\\\]", 1))
-        .otherwise(lit("stream")))
-      .withColumn("label_path", toLabelUri(col("path")))
-      .withColumn("label_data", readLabel(col("label_path")))
-      .withColumn("yolo_line",   explode_outer(split(trim(col("label_data")), "\n")))
-      .withColumn("yolo_tokens", split(trim(col("yolo_line")), "\\s+"))
-      .withColumn("class_id", yoloField(1).cast("int"))
-      .withColumn("cx_norm",  yoloField(2).cast("double"))
-      .withColumn("cy_norm",  yoloField(3).cast("double"))
-      .withColumn("w_norm",   yoloField(4).cast("double"))
-      .withColumn("h_norm",   yoloField(5).cast("double"))
-      .withColumn("bbox_area_norm", col("w_norm") * col("h_norm"))
-      .withColumn("aspect_ratio",
-        when(col("h_norm") > 0, col("w_norm") / col("h_norm")))
+      .where(col("path").rlike("(?i)\\.(jpg|jpeg|png)$")) // images uniquement
+      .where(col("content").isNotNull && col("length") > 0) // écarte les fichiers vides
       .select(
-        col("image_name"),
-        col("split"),
+        regexp_extract(col("path"), "(?i)([^/\\\\]+)\\.(jpg|jpeg|png)$", 1).as("image_name"),
         col("path").as("image_path"),
         col("content").as("image_data"),
+        col("length"),
         col("modificationTime").as("ingested_at"),
-        col("label_path"),
-        col("label_data"),
-        col("class_id"),
-        col("cx_norm"), col("cy_norm"), col("w_norm"), col("h_norm"),
-        col("bbox_area_norm"), col("aspect_ratio"),
         current_timestamp().as("processed_at"))
-  }
 
   def main(args: Array[String]): Unit = {
     val ingressPath    = if (args.length > 0) args(0) else "data/dest/continuous_ingress"
@@ -113,8 +61,7 @@ object ConsumerApp {
     // Injection du modèle : broadcast une seule fois au démarrage
     ModelLoader.initialize(spark, modelPath.stripSuffix("/").stripSuffix("\\") + "/")
 
-    // 1. FETCH — stream continu sur les fichiers bruts déposés par le Producer
-    //    dans DEST/continuous_ingress/ (jamais sur DEST/ml_dataset/)
+    // 1. FETCH — stream permanent sur les images brutes déposées par le Producer
     val rawStream = spark.readStream
       .format("binaryFile")
       .schema(Schemas.binaryFileSchema) // schéma fixe imposé par la source binaryFile
@@ -125,27 +72,27 @@ object ConsumerApp {
     val query = rawStream.writeStream
       .foreachBatch { (batchDF: DataFrame, batchId: Long) =>
         // 2. PARSE & TRANSFORM — persist : évite de recalculer le batch
-        //    pour chacune des deux écritures + le scoring
+        //    pour les deux écritures + le scoring
         val staged = parseAndTransform(batchDF).persist()
         val rows   = staged.count()
 
         if (rows > 0) {
-          // 3. WRITE (4) — couche staging, lue par le service ML (READ 5)
+          // 3. WRITE intermédiaire — couche staging (historique des images propres)
           staged.write
             .mode("append")
             .option("compression", "snappy")
             .parquet(stagingPath)
 
-          // 4. PREDICT — scoring sur les données fraîchement préparées
+          // 4. PREDICT — vision ONNX directement sur les octets de l'image
           val scored = ModelLoader.score(staged)
 
-          // 5. WRITE OUTPUT — résultats enrichis, lus par Streamlit (READ 8)
+          // 5. WRITE OUTPUT — prédiction + confidence, lus par le dashboard
           scored.write
             .mode("append")
             .option("compression", "snappy")
             .parquet(outputPath)
 
-          println(s"[Consumer] batch $batchId : $rows lignes → staging + output")
+          println(s"[Consumer] batch $batchId : $rows images → staging + output")
         }
         staged.unpersist()
         () // retour Unit explicite : lève l'ambiguïté d'overload de foreachBatch (Scala 2.13)

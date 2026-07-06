@@ -1,15 +1,21 @@
 """
 ML Training — Microservice ML (Python, indépendant de Spark). FLUX HEBDOMADAIRE.
 
-Cycle de vie (une fois par semaine, après le Producer en mode batch) :
-  1. READ 5   : lit la copie DEST/ml_dataset/ (arborescence train/test/val,
-                images + labels YOLO) déposée par le Microservice 1.
-  2. TRAIN    : RandomForestClassifier sur les features géométriques bbox.
-  3. EVALUATE : accuracy / F1 / matrice de confusion sur les sets test et val.
-  4. EXPORT 6 : plate_model.pkl (format contractuel) + plate_model.onnx
-                (consommé par le Consumer Scala via ONNX Runtime) → MODEL/.
-  5. HISTORIQUE : métriques versionnées dans MODEL/metrics/<version>.json,
-                lues par l'onglet "Suivi de l'entraînement" du dashboard.
+Script ÉPHÉMÈRE déclenché une fois par semaine, juste après le Producer en
+mode batch :
+  1. READ      : lit la copie DEST/ml_dataset/ (arborescence train/test/val,
+                 images + labels YOLO — les labels ne servent QU'ICI, jamais
+                 dans le stream d'inférence).
+  2. FEATURES  : chaque image est réduite en S×S RGB, aplatie CHW, /255 —
+                 EXACTEMENT le prétraitement appliqué par ModelLoader.scala
+                 au moment du scoring (le stream n'a pas de labels, le modèle
+                 doit prédire depuis les pixels bruts).
+  3. TRAIN     : RandomForestClassifier ; cible = présence d'un label YOLO
+                 non vide (plaque) vs absence (background).
+  4. EVALUATE  : accuracy / F1 / matrice de confusion sur test et val.
+  5. EXPORT    : plate_model.onnx (consommé par le Consumer Scala) +
+                 plate_model.pkl (backup) → MODEL/ ; métriques versionnées
+                 dans MODEL/metrics/<version>.json (onglet 2 du dashboard).
 
 Usage :
     python ml/train_model.py --dataset-dir data/dest/ml_dataset --model-dir data/models
@@ -36,60 +42,52 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-# Features géométriques — doivent correspondre exactement à ModelLoader.FEATURE_COLS (Scala)
-FEATURE_COLS = ["bbox_area_norm", "aspect_ratio", "cx_norm", "cy_norm", "w_norm", "h_norm"]
+# Côté image : S×S RGB aplati CHW → 3*S*S features.
+# ModelLoader.scala DÉDUIT S de la forme d'entrée du modèle ONNX : changer
+# IMG_SIDE ici suffit, aucun changement côté Scala.
+IMG_SIDE = 32
+N_FEATURES = 3 * IMG_SIDE * IMG_SIDE
+
 IMAGE_EXTS = (".jpg", ".jpeg", ".png")
 # Le dataset utilise "valid", le cahier des charges dit "val" : on accepte les deux.
 SPLIT_ALIASES = {"train": "train", "test": "test", "val": "val", "valid": "val"}
 
 
-def parse_label_file(path: str):
-    """Parse un label YOLO : une ligne = class_id cx cy w h (normalisés)."""
-    boxes = []
+def has_plate_label(image_path: str) -> bool:
+    """Vrai si un label YOLO non vide existe pour cette image (≥ 1 bbox valide)."""
+    label = (os.path.splitext(image_path)[0] + ".txt").replace(
+        f"{os.sep}images{os.sep}", f"{os.sep}labels{os.sep}")
     try:
-        with open(path, encoding="utf-8") as f:
-            for line in f:
-                tokens = line.split()
-                if len(tokens) >= 5:
-                    cls, cx, cy, w, h = (float(t) for t in tokens[:5])
-                    boxes.append((int(cls), cx, cy, w, h))
+        with open(label, encoding="utf-8") as f:
+            return any(len(line.split()) >= 5 for line in f)
     except OSError:
-        pass
-    return boxes
+        return False
+
+
+def image_to_features(image_path: str) -> np.ndarray:
+    """Image → vecteur float32 [3*S*S] : resize S×S RGB, /255, aplati CHW.
+    Doit rester identique au prétraitement de ModelLoader.scala (toFloatCHW)."""
+    from PIL import Image
+    with Image.open(image_path) as img:
+        arr = np.asarray(img.convert("RGB").resize((IMG_SIDE, IMG_SIDE)),
+                         dtype=np.float32) / 255.0
+    return arr.transpose(2, 0, 1).ravel()  # HWC → CHW, aplati
 
 
 def load_dataset(dataset_dir: str) -> pd.DataFrame:
-    """
-    READ 5 — lit la copie hebdomadaire DEST/ml_dataset/ (train/test/val).
-    Une ligne par bounding box ; les images sans label produisent une ligne
-    à features nulles (négatifs "background").
-    """
+    """READ — parcourt la copie hebdo DEST/ml_dataset/ (une ligne par image)."""
     rows = []
     for entry in sorted(os.listdir(dataset_dir)):
         split = SPLIT_ALIASES.get(entry.lower())
         split_dir = os.path.join(dataset_dir, entry)
         if split is None or not os.path.isdir(split_dir):
             continue
-        images = [p for p in glob.glob(os.path.join(split_dir, "**", "*"), recursive=True)
-                  if p.lower().endswith(IMAGE_EXTS)]
-        for img in images:
-            name = os.path.splitext(os.path.basename(img))[0]
-            label = (os.path.splitext(img)[0] + ".txt").replace(
-                f"{os.sep}images{os.sep}", f"{os.sep}labels{os.sep}")
-            boxes = parse_label_file(label) if os.path.exists(label) else []
-            if boxes:
-                for cls, cx, cy, w, h in boxes:
-                    rows.append({
-                        "image_name": name, "split": split, "class_id": cls,
-                        "cx_norm": cx, "cy_norm": cy, "w_norm": w, "h_norm": h,
-                        "bbox_area_norm": w * h,
-                        "aspect_ratio": (w / h) if h > 0 else np.nan,
-                    })
-            else:
-                rows.append({"image_name": name, "split": split, "class_id": None,
-                             "cx_norm": None, "cy_norm": None, "w_norm": None,
-                             "h_norm": None, "bbox_area_norm": None, "aspect_ratio": None})
-
+        for img in glob.glob(os.path.join(split_dir, "**", "*"), recursive=True):
+            if img.lower().endswith(IMAGE_EXTS):
+                rows.append({"image_path": img,
+                             "image_name": os.path.splitext(os.path.basename(img))[0],
+                             "split": split,
+                             "target": int(has_plate_label(img))})
     if not rows:
         print(f"[Train] Aucune image dans {dataset_dir} — lancer d'abord "
               "le Producer en mode batch (python main.py --weekly).")
@@ -97,33 +95,35 @@ def load_dataset(dataset_dir: str) -> pd.DataFrame:
 
     df = pd.DataFrame(rows)
     counts = df.groupby("split")["image_name"].nunique().to_dict()
-    print(f"[Train] {df['image_name'].nunique()} images / {len(df)} lignes lues "
-          f"depuis {dataset_dir} — répartition : {counts}")
+    print(f"[Train] {len(df)} images lues depuis {dataset_dir} — répartition : {counts}")
     return df
 
 
-def prepare_xy(df: pd.DataFrame):
-    """
-    Cible binaire : 1 si la ligne porte une bounding box YOLO (class_id non-null),
-    0 sinon (image sans label = background).
-    NB : le dataset est mono-classe, class_id vaut 0 pour toutes les plaques —
-    la présence de la bbox EST le signal, pas la valeur de class_id.
-    """
-    y = df["class_id"].notna().astype(int)
-    X = df[FEATURE_COLS].fillna(0.0).astype(np.float32)
-    return X, y
+def build_features(df: pd.DataFrame) -> np.ndarray:
+    """Vectorise toutes les images (S×S → mémoire maîtrisée : 3*S*S float32/image)."""
+    print(f"[Train] Extraction des features pixels ({IMG_SIDE}×{IMG_SIDE} RGB, "
+          f"{N_FEATURES} dims) ...")
+    X = np.zeros((len(df), N_FEATURES), dtype=np.float32)
+    for i, path in enumerate(df["image_path"].to_numpy()):
+        try:
+            X[i] = image_to_features(path)
+        except Exception:
+            pass  # image illisible → vecteur nul, sera un point de bruit
+        if (i + 1) % 2000 == 0:
+            print(f"[Train]   ... {i + 1}/{len(df)} images vectorisées")
+    return X
 
 
 def split_sets(df, X, y):
     """Sépare selon l'arborescence train/test/val du dataset."""
     sets = {}
     for split in ("train", "val", "test"):
-        mask = df["split"] == split
+        mask = (df["split"] == split).to_numpy()
         sets[split] = (X[mask], y[mask])
     # Fallback aléatoire si l'arborescence est incomplète
     if len(sets["train"][0]) == 0 or len(sets["test"][0]) == 0:
         from sklearn.model_selection import train_test_split
-        strat = y if y.nunique() > 1 else None
+        strat = y if len(np.unique(y)) > 1 else None
         X_tr, X_tmp, y_tr, y_tmp = train_test_split(X, y, test_size=0.30,
                                                     random_state=42, stratify=strat)
         X_val, X_te, y_val, y_te = train_test_split(X_tmp, y_tmp, test_size=0.50,
@@ -138,7 +138,7 @@ def train(X_train, y_train):
     from sklearn.ensemble import RandomForestClassifier
     clf = RandomForestClassifier(
         n_estimators=100,
-        max_depth=10,
+        max_depth=12,
         min_samples_split=5,
         class_weight="balanced",
         random_state=42,
@@ -172,13 +172,13 @@ def evaluate(clf, sets) -> dict:
 
 def export_onnx(clf, model_dir: str) -> str:
     """
-    EXPORT 6 — ONNX avec zipmap=False pour que la sortie probabilités soit un
+    EXPORT — ONNX avec zipmap=False pour que la sortie probabilités soit un
     Array[Array[Float]] (consommé tel quel par ModelLoader.scala via ONNX Runtime).
     """
     from skl2onnx import convert_sklearn
     from skl2onnx.common.data_types import FloatTensorType
 
-    initial_types = [("float_input", FloatTensorType([None, len(FEATURE_COLS)]))]
+    initial_types = [("float_input", FloatTensorType([None, N_FEATURES]))]
     # target_opset=21 : le Consumer utilise onnxruntime Java 1.20, qui refuse
     # les modèles opset 22+ (skl2onnx récent exporte en 22 par défaut)
     onnx_model = convert_sklearn(clf, initial_types=initial_types,
@@ -189,16 +189,16 @@ def export_onnx(clf, model_dir: str) -> str:
         f.write(onnx_model.SerializeToString())
     print(f"[Train] Modèle ONNX exporté → {onnx_path}")
 
-    # Vérification des noms d'entrées/sorties (contrat avec ModelLoader.scala)
+    # Vérification du contrat avec ModelLoader.scala (noms + forme d'entrée)
     import onnxruntime as rt
     sess = rt.InferenceSession(onnx_path)
-    print(f"[Train] Inputs  ONNX : {[i.name for i in sess.get_inputs()]}")
+    print(f"[Train] Inputs  ONNX : {[(i.name, i.shape) for i in sess.get_inputs()]}")
     print(f"[Train] Outputs ONNX : {[o.name for o in sess.get_outputs()]}")
     return onnx_path
 
 
 def export_pickle(clf, model_dir: str) -> str:
-    """EXPORT 6 — format .pkl contractuel du cahier des charges."""
+    """EXPORT — backup pickle."""
     pkl_path = os.path.join(model_dir, "plate_model.pkl")
     with open(pkl_path, "wb") as f:
         pickle.dump(clf, f)
@@ -207,7 +207,7 @@ def export_pickle(clf, model_dir: str) -> str:
 
 
 def write_metrics(model_dir: str, version: str, df: pd.DataFrame,
-                  dataset_dir: str, results: dict, clf) -> str:
+                  dataset_dir: str, results: dict) -> str:
     """Historique versionné — consommé par l'onglet 2 du dashboard Streamlit."""
     metrics_dir = os.path.join(model_dir, "metrics")
     os.makedirs(metrics_dir, exist_ok=True)
@@ -215,12 +215,10 @@ def write_metrics(model_dir: str, version: str, df: pd.DataFrame,
         "version": version,
         "trained_at": datetime.now(timezone.utc).isoformat(),
         "dataset_dir": os.path.abspath(dataset_dir),
-        "dataset_images": int(df["image_name"].nunique()),
-        "dataset_rows": int(len(df)),
+        "dataset_images": int(len(df)),
         "split_counts": {k: int(v) for k, v in
                          df.groupby("split")["image_name"].nunique().items()},
-        "feature_importances": {c: round(float(v), 4) for c, v in
-                                zip(FEATURE_COLS, clf.feature_importances_)},
+        "img_side": IMG_SIDE,
         "metrics": results,
     }
     path = os.path.join(metrics_dir, f"{version}.json")
@@ -245,18 +243,17 @@ def main():
     print(f"[Train] Run hebdomadaire {version}")
 
     df = load_dataset(args.dataset_dir)
-
-    X, y = prepare_xy(df)
+    y = df["target"].to_numpy()
     print(f"[Train] Distribution classes — 0 (background): {(y == 0).sum()}, 1 (plate): {(y == 1).sum()}")
-    if y.nunique() < 2:
+    if len(np.unique(y)) < 2:
         print("[Train] ATTENTION : une seule classe présente — le modèle prédira "
               "toujours cette classe. Ajouter des images sans label pour des négatifs.")
 
+    X = build_features(df)
     sets = split_sets(df, X, y)
 
     print("\n[Train] Entraînement RandomForestClassifier...")
     clf = train(*sets["train"])
-    print(f"[Train] Feature importances : {dict(zip(FEATURE_COLS, clf.feature_importances_.round(3)))}")
 
     results = evaluate(clf, sets)
 
@@ -264,7 +261,7 @@ def main():
         export_pickle(clf, args.model_dir)
     if args.format in ("onnx", "both"):
         export_onnx(clf, args.model_dir)
-    write_metrics(args.model_dir, version, df, args.dataset_dir, results, clf)
+    write_metrics(args.model_dir, version, df, args.dataset_dir, results)
 
     print(f"\n[Train] Modèle {version} disponible dans : {args.model_dir}")
     print("[Train] Le Consumer charge plate_model.onnx automatiquement au prochain démarrage.")
