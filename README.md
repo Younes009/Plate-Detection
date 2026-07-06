@@ -1,11 +1,15 @@
-# License Plate Detection — Pipeline Spark Batch + Streaming + ML
+# License Plate Detection — Pipeline Spark Streaming + ML
 
-Pipeline Big Data Scala/Spark en deux microservices :
+Pipeline Big Data à deux temporalités (voir [ARCHITECTURE.md](ARCHITECTURE.md)) :
 
-**Microservice 1 (Producer)** : ingestion batch récursive (YOLO/COCO/Pascal VOC) → `DEST/`  
-**Microservice 2 (Consumer)** : Structured Streaming → parse/transform/score/predict → `OUTPUT/`  
-**ML** : entraînement sklearn sur `OUTPUT/`, export ONNX/pickle → Consumer recharge le modèle  
-**Streamlit** : dashboard lecture seule sur `OUTPUT/`
+- **Flux continu (inférence)** : Producer (Hadoop FS) déplace les nouvelles images
+  `SOURCE/continuous_ingress/` → `DEST/continuous_ingress/` ; Consumer (Spark
+  Structured Streaming) les parse, écrit la couche staging, applique le modèle
+  ONNX et écrit `OUTPUT/` ; dashboard Streamlit en lecture continue.
+- **Flux hebdomadaire (réentraînement)** : Producer en mode batch copie
+  l'intégralité de `SOURCE/ml_dataset/` (arborescence `train/test/val`) vers
+  `DEST/ml_dataset/` ; le service ML Python entraîne, exporte `.pkl` + `.onnx`
+  dans `MODEL/` et versionne ses métriques.
 
 ---
 
@@ -13,269 +17,180 @@ Pipeline Big Data Scala/Spark en deux microservices :
 
 ```
 plate-detection-spark/
-├── main.py                                                           # point d'entrée unique — orchestre tout le pipeline
-├── build.sbt
-├── common/src/main/scala/com/project/common/Utils.scala             # chemins HDFS, schémas, letterbox, features, parsers
-├── producer/src/main/scala/com/project/producer/ProducerApp.scala   # Microservice 1 — batch récursif batchSize+interval
-├── consumer/src/main/scala/com/project/consumer/ConsumerApp.scala   # Microservice 2 — streaming DEST/ → OUTPUT/
+├── main.py                                                           # orchestrateur des deux flux
+├── build.sbt                                                         # Spark 4.1.1, onnxruntime 1.20
+├── sbt-launch.jar                                                    # launcher sbt embarqué
+├── common/src/main/scala/com/project/common/Utils.scala              # schémas binaryFile/staging/output
+├── producer/src/main/scala/com/project/producer/ProducerApp.scala    # Microservice 1 — modes continuous & batch
+├── consumer/src/main/scala/com/project/consumer/ConsumerApp.scala    # Microservice 2 — Structured Streaming
 ├── ml/
-│   ├── src/main/scala/com/project/ml/ModelLoader.scala              # scoring PyTorch ONNX → sklearn ONNX → MLlib → simulé
-│   ├── checkpoints/best_model.pt                                     # modèle PyTorch pré-entraîné (détection plaques)
-│   ├── export_pytorch.py                                             # export best_model.pt → best_model.onnx
-│   └── train_model.py                                                # entraînement sklearn sur OUTPUT/ → plate_model.onnx
-└── streamlit/app.py                                                  # dashboard lecture seule ← OUTPUT/
+│   ├── src/main/scala/com/project/ml/ModelLoader.scala               # scoring ONNX broadcasté
+│   ├── train_model.py                                                # réentraînement hebdo + métriques versionnées
+│   ├── export_pytorch.py                                             # export optionnel best_model.pt → best_model.onnx
+│   ├── checkpoints/                                                  # modèle PyTorch pré-entraîné (optionnel)
+│   └── requirements.txt
+├── streamlit/
+│   ├── app.py                                                        # dashboard 2 onglets (flux + entraînement)
+│   └── requirements.txt
+└── data/                                                             # zones de stockage (créées par main.py)
+    ├── source/{continuous_ingress, ml_dataset}/
+    ├── dest/{continuous_ingress, ml_dataset}/
+    ├── staging/  ├── output/  ├── models/{metrics/}  └── checkpoint/
 ```
+
+> Si `data/source/ml_dataset/` est absent, le dataset livré
+> `license-plate-detection-dataset-10125-images/` joue ce rôle automatiquement.
 
 ---
 
-## Dossiers HDFS
+## Prérequis
 
-```
-hdfs:///project/source/               # images + annotations source (créé automatiquement si absent)
-hdfs:///project/dest/                 # sortie Producer — batch_N_TS/ (Parquet Snappy)
-hdfs:///project/output/               # sortie Consumer — données enrichies + prédictions (Parquet Snappy, append)
-hdfs:///project/output/predictions/   # sous-ensemble (image_path, prediction, confidence_score, processed_at)
-hdfs:///project/models/               # plate_model.onnx (export Python) ou spark_model/ (PipelineModel MLlib)
-hdfs:///project/checkpoint/consumer/  # checkpoint Structured Streaming (exactly-once)
-hdfs:///project/logs/producer/        # log d'exécution Producer (Parquet, append)
-```
+- Java 17, Spark **4.1.1** (`spark-submit` dans le PATH — la version doit
+  matcher `build.sbt`), Python 3.11+
+- `pip install -r ml/requirements.txt -r streamlit/requirements.txt`
 
 ---
 
 ## Lancement rapide — `main.py`
 
-`main.py` orchestre tout le pipeline en une seule commande.
-
 ```bash
-# Pipeline complet : build → producer → consumer → streamlit
+# Flux continu complet : build → producer continuous → consumer → dashboard
 python main.py
 
-# Jars déjà buildés (gain de temps)
-python main.py --skip-build
+# Simuler des arrivées (50 images test → SOURCE/continuous_ingress) puis flux continu
+python main.py --seed 50 --skip-build
 
-# Consumer + Streamlit seulement (dest/ déjà rempli)
-python main.py --skip-build --skip-producer
+# Flux hebdomadaire : copie ml_dataset + réentraînement + métriques, puis exit
+python main.py --weekly --skip-build
 
-# Dashboard seul (output/ déjà rempli)
+# Dashboard seul
 python main.py --streamlit-only
 ```
 
-**Options disponibles :**
+**Options :**
 
 | Option | Défaut | Description |
 |--------|--------|-------------|
+| `--weekly` | false | Run hebdo : Producer batch + entraînement ML, puis exit |
+| `--seed N` | 0 | Dépose N images test dans `SOURCE/continuous_ingress` (simulation) |
 | `--skip-build` | false | Skip `sbt assembly` |
-| `--skip-producer` | false | Skip le Producer |
-| `--streamlit-only` | false | Lance uniquement Streamlit |
-| `--batch-size N` | 100 | Images par batch Producer |
-| `--interval N` | 0 | Secondes entre batches |
+| `--streamlit-only` | false | Lance uniquement le dashboard |
+| `--batch-size N` | 100 | Fichiers par lot Producer |
+| `--interval N` | 5 | Secondes entre lots Producer |
 
-**Séquence exécutée par `main.py` :**
-1. Build fat-jars via `sbt-launch.jar`
-2. Producer en foreground → attend la fin
-3. Consumer en arrière-plan → attend les premiers fichiers dans `data/output/`
-4. Streamlit en foreground sur `:8501` → `Ctrl+C` arrête tout
+**Séquence du flux continu :** producer continuous (arrière-plan, veille de
+l'ingress) → consumer streaming (arrière-plan) → Streamlit en foreground sur
+`:8501` → `Ctrl+C` arrête tout.
+
+**Planification hebdomadaire :**
+
+```bash
+# Windows
+schtasks /Create /SC WEEKLY /D MON /ST 03:00 /TN PlateRetrain /TR "python C:\...\main.py --weekly --skip-build"
+# Linux (crontab)
+0 3 * * 1  cd /opt/pipeline && python main.py --weekly --skip-build
+```
 
 ---
 
 ## Build manuel
 
 ```bash
-java -Xmx512m -jar sbt-launch.jar clean assembly
+java -Xmx512m -jar sbt-launch.jar assembly
 ```
 
-Produit :
-- `producer/target/scala-2.13/producer-assembly-0.1.0.jar`
-- `consumer/target/scala-2.13/consumer-assembly-0.1.0.jar`
-
-> `onnxruntime 1.18.0` est bundlé dans le fat-jar du Consumer (non-provided).
+Produit `producer-assembly-0.1.0.jar` et `consumer-assembly-0.1.0.jar`
+(`onnxruntime 1.20` bundlé dans le fat-jar du Consumer).
 
 ---
 
-## Exécution manuelle — ordre obligatoire
+## Exécution manuelle des services
 
-### Étape 1 — Producer (Microservice 1)
+### Microservice 1 — Producer (Hadoop FS, transfert brut)
 
 ```bash
-spark-submit \
-  --class com.project.producer.ProducerApp \
-  --master yarn --deploy-mode cluster \
-  --driver-memory 4g --executor-memory 4g --executor-cores 2 \
+# Args : sourcePath destPath batchSize intervalSeconds recursive mode
+
+# Flux continu : veille + déplacement au fil de l'eau
+spark-submit --master local[2] \
   producer/target/scala-2.13/producer-assembly-0.1.0.jar \
-  hdfs:///project/source/ \   # sourcePath  : dossier images + annotations
-  hdfs:///project/dest/   \   # destPath    : où écrire les batches
-  100                     \   # batchSize   : images par batch
-  30                          # interval    : secondes entre batches
+  data/source/continuous_ingress data/dest/continuous_ingress 100 5 true continuous
+
+# Flux hebdo : copie récursive intégrale (arborescence train/test/val préservée)
+spark-submit --master local[2] \
+  producer/target/scala-2.13/producer-assembly-0.1.0.jar \
+  data/source/ml_dataset data/dest/ml_dataset 100 0 true batch
 ```
 
-**Logique :**
-- Crée `sourcePath` s'il n'existe pas.
-- Parcourt récursivement `sourcePath` pour trouver toutes les images (`.jpg/.jpeg/.png`) et annotations (`.txt` YOLO / `.json` COCO / `.xml` VOC) dans n'importe quelle sous-arborescence.
-- Charge les annotations **une seule fois** (cache Spark), groupe les images en batches de `batchSize`.
-- Pour chaque batch :
-  1. Lit les images (Spark `binaryFile`).
-  2. Joint avec les annotations (left join → image sans annotation = background).
-  3. Letterbox resize 256×256 (Java AWT/ImageIO) + reprojection des bbox.
-  4. Calcule les features bbox : coordonnées absolues, aires, `aspect_ratio`, quadrants, `num_boxes`.
-  5. Écrit en Parquet Snappy dans `destPath/batch_N_TS/`.
-  6. Attend `interval` secondes avant le batch suivant.
-- S'arrête automatiquement après le dernier batch (**batch pur, aucune boucle infinie**).
-
-Formats d'annotations supportés :
-| Format | Fichier attendu | Détection |
-|--------|----------------|-----------|
-| **YOLO** | `*.txt` (5 colonnes : `class_id cx cy w h`) | toute profondeur sous `sourcePath` |
-| **COCO** | `*.json` (champs `images`, `annotations`, `categories`) | toute profondeur |
-| **Pascal VOC** | `*.xml` (`<annotation><size><object><bndbox>`) | toute profondeur |
-
----
-
-### Étape 2 — Consumer phase 1 (sans modèle ML)
+### Microservice 2 — Consumer (Structured Streaming)
 
 ```bash
-spark-submit \
-  --class com.project.consumer.ConsumerApp \
-  --master yarn --deploy-mode cluster \
-  --driver-memory 2g --executor-memory 4g --executor-cores 2 --num-executors 2 \
+# Args : ingressPath stagingPath outputPath modelPath checkpointPath
+spark-submit --master local[2] \
   consumer/target/scala-2.13/consumer-assembly-0.1.0.jar \
-  hdfs:///project/dest/        \   # destPath
-  hdfs:///project/output/      \   # outputPath
-  hdfs:///project/models/      \   # modelPath (vide → scoring simulé)
-  hdfs:///project/checkpoint/       # checkpointPath
+  data/dest/continuous_ingress data/staging data/output data/models data/checkpoint
 ```
 
-**Logique :**
-- Lit `destPath/` en **Structured Streaming** (schéma explicite `destSchema`, `maxFilesPerTrigger=1`).
-- Pour chaque micro-batch (`foreachBatch`) :
-  1. **Filtre** anomalies (`num_boxes` null).
-  2. **Enrichit** : `quality_flag` (`OK` / `TOO_SMALL` / `BAD_RATIO` / `NO_PLATE`) + `processed_at`.
-  3. **Score** : `ModelLoader` (ONNX → MLlib → simulé) → colonnes `prediction` + `confidence_score`.
-  4. **Écriture 1** : flux complet → `outputPath/` (append, Parquet Snappy).
-  5. **Écriture 2** : `(image_path, prediction, confidence_score, processed_at)` → `outputPath/predictions/` (append).
-- Checkpoint `hdfs:///project/checkpoint/consumer/` (sémantique **exactly-once**).
-- Tourne indéfiniment via `awaitTermination()`.
+Ordre strict par micro-batch : **FETCH → PARSE/TRANSFORM → WRITE staging →
+PREDICT (ONNX broadcasté) → WRITE output**. Exactly-once via checkpoint,
+`awaitTermination()` — aucun DStream, aucune boucle manuelle.
 
----
-
-### Étape 3 — Entraînement ML
+### Service ML — réentraînement hebdomadaire
 
 ```bash
-# Installer les dépendances Python
-pip install pyspark scikit-learn skl2onnx onnxruntime numpy pandas
-
-# Entraîner et exporter
-python ml/train_model.py \
-  --output-dir hdfs:///project/output/ \   # features produites par le Consumer
-  --model-dir  ./models                \   # dossier local de sortie
-  --format     both                        # onnx + pickle
-
-# Copier le modèle ONNX vers HDFS
-hdfs dfs -put models/plate_model.onnx hdfs:///project/models/
+python ml/train_model.py --dataset-dir data/dest/ml_dataset --model-dir data/models
 ```
 
-**Logique :**
-- Lit `outputPath/` (Parquet) avec PySpark → convertit en Pandas.
-- Cible : `1` si `class_id` non-null (plaque annotée), `0` sinon (background).
-- Utilise la colonne `split` (`train` / `valid` / `test` / `unknown`) pour les splits — fallback aléatoire 70/15/15 si vide.
-- Features : `bbox_area_norm`, `aspect_ratio`, `cx_norm`, `cy_norm`, `w_norm`, `h_norm`.
-- Modèle : `RandomForestClassifier` (100 arbres, `class_weight=balanced`).
-- Export **ONNX** (`skl2onnx`, `zipmap=False`) → `plate_model.onnx`.
-- Export **pickle** → `plate_model.pkl` (backup Python).
+- Lit la copie hebdo (images + labels YOLO, splits depuis l'arborescence).
+- Exporte `plate_model.pkl` + `plate_model.onnx` (opset 21, requis par
+  onnxruntime Java 1.20).
+- Versionne accuracy / F1 / matrice de confusion (test + val) dans
+  `data/models/metrics/<version>.json`.
+- Le Consumer charge le nouveau modèle à son prochain démarrage.
 
----
-
-### Étape 4 — Consumer phase 2 (avec modèle ONNX)
-
-Relancer la **même commande** spark-submit qu'à l'étape 2.  
-`ModelLoader.initialize()` détecte `plate_model.onnx` dans `modelPath/` → charge et broadcast les bytes → scoring ONNX réel via `mapPartitions` (une session ONNX Runtime par partition).
-
----
-
-### Étape 5 — Dashboard Streamlit
+### Dashboard
 
 ```bash
-cd streamlit
-pip install -r requirements.txt
-streamlit run app.py
+python -m streamlit run streamlit/app.py
 ```
 
-- Lit `hdfs:///project/output/` et `hdfs:///project/output/predictions/` (lecture seule).
-- Filtres sidebar : split, label, quality_flag, prédiction, seuil confidence.
-- KPIs : plaques détectées, images distinctes, confidence moyenne, bbox/image.
-- Charts : prédiction, taille bbox, quality_flag, split, histogramme confidence.
-- Bouton de rafraîchissement manuel + cache TTL 60 s.
+Deux onglets :
+1. **Suivi des prédictions & du flux** — Pipeline Tracker (En attente `/SOURCE`
+   → En transit `/DEST` → Traités `/OUTPUT`), table de traçabilité par fichier
+   (Reçu / En cours / Traité, prédiction + confidence), débit du stream,
+   aperçu des dernières images avec bbox.
+2. **Suivi de l'entraînement** — modèle actif (version, date, volume dataset),
+   métriques du dernier run (accuracy, F1, matrices de confusion test/val),
+   évolution historique de la précision.
 
 ---
 
 ## Schémas de données
 
-### `DEST/` — sortie Producer (`destSchema`)
+Voir [ARCHITECTURE.md](ARCHITECTURE.md#schémas-des-données). En résumé :
 
-| Colonne | Type | Description |
-|---------|------|-------------|
-| `image_name` | String | Nom du fichier image (sans extension) |
-| `split` | String | `train` / `valid` / `test` / `unknown` |
-| `image_path` | String | Chemin complet de l'image source |
-| `label` | String | Classe (YOLO classes.txt / COCO categories / VOC name) |
-| `orig_width`, `orig_height` | Int | Dimensions originales de l'image |
-| `image_data` | Binary | Image letterboxée 256×256 encodée JPEG |
-| `class_id` | Int | Identifiant de classe (null si background) |
-| `cx_norm`, `cy_norm`, `w_norm`, `h_norm` | Double | Bbox normalisée après letterbox |
-| `x_min`, `y_min`, `x_max`, `y_max` | Double | Bbox en pixels (256×256) |
-| `bbox_area`, `bbox_area_norm`, `aspect_ratio` | Double | Features géométriques |
-| `bbox_size_category` | String | `small` / `medium` / `large` |
-| `center_x_quadrant`, `center_y_quadrant` | String | `left`/`right`, `top`/`bottom` |
-| `num_boxes` | Int | Nombre de plaques sur l'image |
-| `ingested_at` | Timestamp | Timestamp d'ingestion Producer |
-
-### `OUTPUT/` — sortie Consumer (`outputSchema` = destSchema +)
-
-| Colonne | Type | Description |
-|---------|------|-------------|
-| `quality_flag` | String | `OK` / `TOO_SMALL` / `BAD_RATIO` / `NO_PLATE` |
-| `prediction` | String | `plate` / `background` / `uncertain` |
-| `confidence_score` | Double | Score de confiance [0, 1] |
-| `processed_at` | Timestamp | Timestamp de traitement Consumer |
+- **DEST** : schéma fixe de la source `binaryFile` (`path`, `modificationTime`,
+  `length`, `content`) — fichiers bruts, aucun prétraitement.
+- **STAGING** : une ligne par bounding box YOLO — `image_name`, `split`,
+  features géométriques (`cx/cy/w/h_norm`, `bbox_area_norm`, `aspect_ratio`).
+- **OUTPUT** : staging + `prediction` (`plate`/`background`/`uncertain`) +
+  `confidence_score` [0, 1].
+- **MODEL/metrics/*.json** : version, date, volume, accuracy/F1/confusion par split.
 
 ---
 
 ## Modèle ML — priorité de chargement (ModelLoader)
 
 ```
-1. best_model.onnx    → PyTorch exporté (image-based : image_data [1,3,256,256])
-                         produit par : ml/export_pytorch.py ← ml/checkpoints/best_model.pt
-2. plate_model.onnx   → sklearn RandomForest (feature-based : 6 features bbox)
-                         produit par : ml/train_model.py ← OUTPUT/
+1. best_model.onnx    → CNN PyTorch (scoring sur image_data)
+2. plate_model.onnx   → sklearn RandomForest (6 features bbox)   ← produit par train_model.py
 3. spark_model/       → Spark MLlib PipelineModel
-4. (aucun fichier)    → scoring simulé heuristique (ratio bbox ≈ 3.1, area, quality_flag)
+4. (aucun fichier)    → fallback heuristique (uncertain, 0.5)
 ```
 
-### Workflow modèle PyTorch (recommandé)
-
-```bash
-# 1. Exporter best_model.pt → ONNX
-pip install torch onnx onnxruntime
-python ml/export_pytorch.py \
-  --checkpoint ml/checkpoints/best_model.pt \
-  --output     ml/checkpoints/best_model.onnx \
-  --img-size   256 \
-  --num-classes 2
-
-# 2. Copier vers HDFS (le Consumer le chargera au prochain démarrage)
-hdfs dfs -put ml/checkpoints/best_model.onnx hdfs:///project/models/
-```
-
-> Si le chargement du modèle PyTorch échoue (architecture inconnue), `export_pytorch.py`
-> tente un wrapper ResNet-18 avec `strict=False`. Définir manuellement l'architecture
-> dans le script si nécessaire.
-
-### Workflow modèle sklearn (alternatif, si best_model.onnx absent)
-
-```bash
-pip install pyspark scikit-learn skl2onnx onnxruntime
-python ml/train_model.py --output-dir hdfs:///project/output/ --model-dir ./models
-hdfs dfs -put models/plate_model.onnx hdfs:///project/models/
-```
+Le fichier ONNX est broadcasté aux executors ; une session ONNX Runtime par
+partition. Les noms de sorties skl2onnx anciens (`output_label`/`output_probability`)
+et récents (`label`/`probabilities`) sont tous deux acceptés.
 
 ---
 
@@ -284,10 +199,8 @@ hdfs dfs -put models/plate_model.onnx hdfs:///project/models/
 | Composant | Version |
 |-----------|---------|
 | Scala | 2.13.14 |
-| Spark | 4.1.1 |
-| ONNX Runtime (Java) | 1.18.0 |
-| Python | 3.8+ |
-| scikit-learn | ≥ 1.3 |
-| skl2onnx | ≥ 1.16 |
-| onnxruntime (Python) | ≥ 1.18 |
-| Streamlit | ≥ 1.30 |
+| Spark | **4.1.1** (runtime = build, sinon `NoSuchMethodError`) |
+| ONNX Runtime (Java) | 1.20.0 |
+| Python | 3.11+ |
+| scikit-learn / skl2onnx | ≥ 1.4 / ≥ 1.16 (export opset 21) |
+| Streamlit | ≥ 1.49 |
