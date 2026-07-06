@@ -2,14 +2,17 @@
 
 Pipeline Big Data à deux temporalités (voir [ARCHITECTURE.md](ARCHITECTURE.md)) :
 
-- **Flux continu (inférence)** : Producer (Hadoop FS) déplace les nouvelles images
-  `SOURCE/continuous_ingress/` → `DEST/continuous_ingress/` ; Consumer (Spark
-  Structured Streaming) les parse, écrit la couche staging, applique le modèle
-  ONNX et écrit `OUTPUT/` ; dashboard Streamlit en lecture continue.
+- **Flux continu (inférence)** : Producer **éphémère** (Hadoop FS, relancé
+  périodiquement par un trigger) déplace les images brutes — sans labels —
+  `SOURCE/continuous_ingress/` → `DEST/continuous_ingress/` ; Consumer
+  (Spark Structured Streaming, **seul service permanent**) les capte, écrit la
+  couche staging, applique le modèle de vision ONNX **directement sur l'image**
+  et écrit `OUTPUT/` ; dashboard Streamlit en lecture continue.
 - **Flux hebdomadaire (réentraînement)** : Producer en mode batch copie
-  l'intégralité de `SOURCE/ml_dataset/` (arborescence `train/test/val`) vers
-  `DEST/ml_dataset/` ; le service ML Python entraîne, exporte `.pkl` + `.onnx`
-  dans `MODEL/` et versionne ses métriques.
+  l'intégralité de `SOURCE/ml_dataset/` (arborescence `train/test/val`, images
+  + labels YOLO) vers `DEST/ml_dataset/` ; le service ML Python entraîne sur
+  les pixels réduits, exporte `.onnx` + `.pkl` dans `MODEL/` et versionne ses
+  métriques.
 
 ---
 
@@ -76,11 +79,13 @@ python main.py --streamlit-only
 | `--skip-build` | false | Skip `sbt assembly` |
 | `--streamlit-only` | false | Lance uniquement le dashboard |
 | `--batch-size N` | 100 | Fichiers par lot Producer |
-| `--interval N` | 5 | Secondes entre lots Producer |
+| `--interval N` | 0 | Secondes entre lots Producer |
+| `--producer-every S` | 60 | Période de relance du Producer continuous (éphémère) |
 
-**Séquence du flux continu :** producer continuous (arrière-plan, veille de
-l'ingress) → consumer streaming (arrière-plan) → Streamlit en foreground sur
-`:8501` → `Ctrl+C` arrête tout.
+**Séquence du flux continu :** consumer streaming permanent (arrière-plan) →
+producer éphémère relancé toutes les `--producer-every` secondes par
+l'orchestrateur (rôle de trigger) → Streamlit en foreground sur `:8501` →
+`Ctrl+C` arrête tout.
 
 **Planification hebdomadaire :**
 
@@ -110,11 +115,12 @@ Produit `producer-assembly-0.1.0.jar` et `consumer-assembly-0.1.0.jar`
 
 ```bash
 # Args : sourcePath destPath batchSize intervalSeconds recursive mode
+# Job ÉPHÉMÈRE dans les deux modes : transfère puis s'arrête tout seul.
 
-# Flux continu : veille + déplacement au fil de l'eau
+# Flux continu : un cycle de déplacement (à relancer via cron/trigger/main.py)
 spark-submit --master local[2] \
   producer/target/scala-2.13/producer-assembly-0.1.0.jar \
-  data/source/continuous_ingress data/dest/continuous_ingress 100 5 true continuous
+  data/source/continuous_ingress data/dest/continuous_ingress 100 0 true continuous
 
 # Flux hebdo : copie récursive intégrale (arborescence train/test/val préservée)
 spark-submit --master local[2] \
@@ -132,8 +138,9 @@ spark-submit --master local[2] \
 ```
 
 Ordre strict par micro-batch : **FETCH → PARSE/TRANSFORM → WRITE staging →
-PREDICT (ONNX broadcasté) → WRITE output**. Exactly-once via checkpoint,
-`awaitTermination()` — aucun DStream, aucune boucle manuelle.
+PREDICT (vision ONNX, directement sur les octets image — aucun label dans le
+stream) → WRITE output**. Exactly-once via checkpoint, `awaitTermination()` —
+aucun DStream, aucune boucle manuelle. Seul service permanent du pipeline.
 
 ### Service ML — réentraînement hebdomadaire
 
@@ -141,9 +148,12 @@ PREDICT (ONNX broadcasté) → WRITE output**. Exactly-once via checkpoint,
 python ml/train_model.py --dataset-dir data/dest/ml_dataset --model-dir data/models
 ```
 
-- Lit la copie hebdo (images + labels YOLO, splits depuis l'arborescence).
-- Exporte `plate_model.pkl` + `plate_model.onnx` (opset 21, requis par
-  onnxruntime Java 1.20).
+- Lit la copie hebdo (images + labels YOLO, splits depuis l'arborescence) —
+  les labels ne servent qu'ici, jamais dans le stream.
+- Features = pixels réduits 32×32 RGB (même prétraitement que le scoring
+  Scala) ; cible = présence d'un label YOLO non vide.
+- Exporte `plate_model.onnx` (entrée `[None, 3072]`, opset 21 — requis par
+  onnxruntime Java 1.20) + `plate_model.pkl` (backup).
 - Versionne accuracy / F1 / matrice de confusion (test + val) dans
   `data/models/metrics/<version>.json`.
 - Le Consumer charge le nouveau modèle à son prochain démarrage.
@@ -171,8 +181,9 @@ Voir [ARCHITECTURE.md](ARCHITECTURE.md#schémas-des-données). En résumé :
 
 - **DEST** : schéma fixe de la source `binaryFile` (`path`, `modificationTime`,
   `length`, `content`) — fichiers bruts, aucun prétraitement.
-- **STAGING** : une ligne par bounding box YOLO — `image_name`, `split`,
-  features géométriques (`cx/cy/w/h_norm`, `bbox_area_norm`, `aspect_ratio`).
+- **STAGING** : une ligne par image propre — `image_name`, `image_path`,
+  `image_data`, `length`, `ingested_at`, `processed_at` (aucun label/bbox :
+  le flux d'inférence ne transporte que des images).
 - **OUTPUT** : staging + `prediction` (`plate`/`background`/`uncertain`) +
   `confidence_score` [0, 1].
 - **MODEL/metrics/*.json** : version, date, volume, accuracy/F1/confusion par split.
@@ -182,11 +193,13 @@ Voir [ARCHITECTURE.md](ARCHITECTURE.md#schémas-des-données). En résumé :
 ## Modèle ML — priorité de chargement (ModelLoader)
 
 ```
-1. best_model.onnx    → CNN PyTorch (scoring sur image_data)
-2. plate_model.onnx   → sklearn RandomForest (6 features bbox)   ← produit par train_model.py
-3. spark_model/       → Spark MLlib PipelineModel
-4. (aucun fichier)    → fallback heuristique (uncertain, 0.5)
+1. best_model.onnx    → CNN PyTorch [1,3,256,256] (ImageNet normalized)
+2. plate_model.onnx   → sklearn RandomForest sur pixels réduits [None, 3*S*S]
+                        (S déduit de la forme du modèle)   ← produit par train_model.py
+3. (aucun fichier)    → fallback neutre (uncertain, 0.5)
 ```
+
+Scoring TOUJOURS directement sur les octets de l'image — aucun label requis.
 
 Le fichier ONNX est broadcasté aux executors ; une session ONNX Runtime par
 partition. Les noms de sorties skl2onnx anciens (`output_label`/`output_probability`)

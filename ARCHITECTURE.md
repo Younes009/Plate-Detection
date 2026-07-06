@@ -40,16 +40,19 @@ dans le stream, elle est lue directement par le service ML Python.
 ### 1. Producer — `producer/ProducerApp.scala` (Spark Core, Scala)
 
 API **Hadoop FileSystem exclusivement** (`org.apache.hadoop.fs`), transfert
-brut octet-à-octet, AUCUN prétraitement. Paramètres : `sourcePath destPath
-batchSize intervalSeconds recursive mode`.
+brut octet-à-octet, AUCUN prétraitement. **Job ÉPHÉMÈRE dans les deux modes**
+— il transfère puis s'arrête tout seul, c'est un déclencheur externe qui le
+relance (main.py toutes les `--producer-every` secondes, ou cron/trigger).
+Paramètres : `sourcePath destPath batchSize intervalSeconds recursive mode`.
 
-- **mode `continuous`** (flux continu) : veille `SOURCE/continuous_ingress/`
-  en permanence et **déplace** les nouvelles images (+ label YOLO éventuel,
-  copié avant l'image) vers `DEST/continuous_ingress/`, par lots de
-  `batchSize` toutes les `intervalSeconds`.
-- **mode `batch`** (flux hebdo) : copie **récursive et intégrale** de
-  `SOURCE/ml_dataset/` vers `DEST/ml_dataset/` en préservant l'arborescence
-  `train/test/val`, lot par lot, puis s'arrête. Idempotent (rejouable).
+- **mode `continuous`** (flux continu, relancé régulièrement) : scanne
+  `SOURCE/continuous_ingress/` (images brutes UNIQUEMENT — aucun label YOLO
+  ici) et **déplace** tout vers `DEST/continuous_ingress/`, par lots de
+  `batchSize`, puis exit. Le déplacement vide la source.
+- **mode `batch`** (flux hebdo, lancé une fois par semaine) : copie
+  **récursive et intégrale** de `SOURCE/ml_dataset/` vers `DEST/ml_dataset/`
+  en préservant l'arborescence `train/test/val` (images ET labels), lot par
+  lot, puis exit. Idempotent (rejouable).
 
 ### 2. Consumer & Predictor — `consumer/ConsumerApp.scala` (Spark Structured Streaming, Scala)
 
@@ -59,13 +62,14 @@ dans chaque micro-batch (`foreachBatch`) :
 
 1. **FETCH** : `readStream.format("binaryFile")` sur `DEST/continuous_ingress/`
    uniquement (`recursiveFileLookup`, `maxFilesPerTrigger=100`, trigger 10 s).
-2. **PARSE & TRANSFORM** : extraction `image_name` / `split`, lecture du label
-   YOLO via Hadoop FS, explode 1 ligne par bounding box, features géométriques
-   typées (`class_id, cx_norm, cy_norm, w_norm, h_norm, bbox_area_norm, aspect_ratio`).
-3. **WRITE INTERMÉDIAIRE** : écriture immédiate des données propres dans
+2. **PARSE & TRANSFORM** : filtre des images valides, typage
+   (`image_name, image_path, image_data, length, ingested_at, processed_at`).
+   **Aucune recherche de label** : le flux ne transporte que des images brutes.
+3. **WRITE INTERMÉDIAIRE** : écriture immédiate des images propres dans
    `data/staging/` (Parquet Snappy) — couche d'historique.
-4. **INJECTION DU MODÈLE & PREDICT** : `ModelLoader.score()` — modèle ONNX
-   broadcasté (injecté au démarrage), ajoute `prediction` + `confidence_score`.
+4. **INJECTION DU MODÈLE & PREDICT** : `ModelLoader.score()` — modèle de
+   vision ONNX broadcasté (injecté au démarrage), scoring **directement sur
+   les octets de l'image**, ajoute `prediction` + `confidence_score`.
 5. **WRITE OUTPUT** : résultats enrichis dans `data/output/`.
 
 ### 3. ML Training — `ml/train_model.py` (Python, indépendant de Spark)
@@ -73,11 +77,15 @@ dans chaque micro-batch (`foreachBatch`) :
 Flux **hebdomadaire** (planifiable via `schtasks` / `cron` sur
 `python main.py --weekly`) :
 
-- **READ 5** : lit la copie `DEST/ml_dataset/` (images + labels YOLO,
-  splits `train/test/val(id)` depuis l'arborescence).
-- Cible = présence d'une bbox YOLO ; features géométriques identiques au Consumer.
-- **EXPORT 6** : `plate_model.pkl` (format contractuel) et `plate_model.onnx`
-  (consommé par le Consumer via ONNX Runtime, opset 21) dans `data/models/`.
+- **READ** : lit la copie `DEST/ml_dataset/` (images + labels YOLO,
+  splits `train/test/val(id)` depuis l'arborescence). Les labels ne servent
+  QUE là — jamais dans le stream.
+- Features = pixels réduits (S×S RGB, aplati CHW, /255 — S=32 par défaut),
+  EXACTEMENT le prétraitement de `ModelLoader.scala` au scoring ; cible =
+  présence d'un label YOLO non vide.
+- **EXPORT** : `plate_model.onnx` (entrée `[None, 3*S*S]` — le Consumer déduit
+  S de la forme du modèle, opset 21) + `plate_model.pkl` (backup) dans
+  `data/models/`.
 - **Historique** : accuracy / F1 / matrice de confusion (test + val), volume
   du dataset et version du run dans `data/models/metrics/<version>.json`.
 
@@ -101,12 +109,12 @@ octets images depuis les Parquet. **Deux onglets** :
 
 ## Chargement du modèle — `ml/ModelLoader.scala`
 
-Priorité (première correspondance gagne) :
+Priorité (première correspondance gagne) — scoring TOUJOURS sur les octets image :
 
-1. `best_model.onnx` — CNN PyTorch exporté, scoring sur `image_data`
-2. `plate_model.onnx` — RandomForest sklearn, scoring sur les 6 features bbox
-3. `spark_model/` — PipelineModel Spark MLlib
-4. Fallback heuristique (`prediction=uncertain`, `confidence=0.5`)
+1. `best_model.onnx` — CNN PyTorch (entrée `[1,3,256,256]`, ImageNet normalized)
+2. `plate_model.onnx` — RandomForest sklearn sur pixels réduits (entrée
+   `[None, 3*S*S]` — S déduit de la forme du modèle, /255, CHW)
+3. Fallback neutre (`prediction=uncertain`, `confidence=0.5`)
 
 Le fichier ONNX est broadcasté aux executors ; une session ONNX Runtime est
 ouverte par partition puis fermée après consommation. Les sorties
@@ -126,20 +134,18 @@ ouverte par partition puis fermée après consommation. Les sorties
 | `length` | Long | Taille en octets |
 | `content` | Binary | Contenu brut |
 
-### STAGING — écrit par le Consumer (WRITE 4), une ligne par bbox
+### STAGING — écrit par le Consumer (WRITE intermédiaire), une ligne par image
 
 | Colonne | Type | Description |
 |---|---|---|
 | `image_name` | String | Nom du fichier sans extension |
-| `split` | String | `train` / `valid` / `val` / `test` / `stream` |
 | `image_path` | String | URI de l'image |
 | `image_data` | Binary | Contenu brut JPEG/PNG |
+| `length` | Long | Taille en octets |
 | `ingested_at` | Timestamp | Date de dépôt dans DEST |
-| `label_path` / `label_data` | String | URI et contenu YOLO brut |
-| `class_id` | Int | Classe YOLO (null si pas de label) |
-| `cx_norm, cy_norm, w_norm, h_norm` | Double | Bbox YOLO normalisée |
-| `bbox_area_norm`, `aspect_ratio` | Double | Features dérivées |
 | `processed_at` | Timestamp | Date de traitement |
+
+Pas de colonnes label/bbox : le flux d'inférence ne transporte que des images.
 
 ### OUTPUT — staging + scoring
 
