@@ -6,26 +6,24 @@ import org.apache.spark.{SparkConf, SparkContext}
 /**
  * Microservice 1 — Producer (Spark Core + API Hadoop FileSystem EXCLUSIVEMENT).
  *
- * Gère les deux temporalités du projet, de manière étanche :
+ * JOB ÉPHÉMÈRE dans les deux modes : on le lance, il transfère, il S'ARRÊTE
+ * TOUT SEUL. Aucune boucle de veille, aucun processus permanent — c'est un
+ * déclencheur externe (orchestrateur, cron, trigger) qui le relance.
  *
- *   - mode "batch" (flux HEBDOMADAIRE — réentraînement) :
- *       copie BRUTE et RÉCURSIVE de l'INTÉGRALITÉ de SOURCE/ml_dataset/
- *       (arborescence train/test/val préservée à l'identique, labels compris)
- *       vers DEST/ml_dataset/. Lot par lot, puis s'arrête de lui-même.
- *       Le service ML Python lit ensuite cette copie pour se réentraîner.
+ *   - mode "continuous" (flux d'inférence, relancé régulièrement) :
+ *       scanne SOURCE/continuous_ingress/ (images brutes UNIQUEMENT — aucun
+ *       label YOLO ici) et DÉPLACE tout ce qui s'y trouve vers
+ *       DEST/continuous_ingress/, par lots de batchSize espacés de
+ *       intervalSeconds. Le déplacement vide la source : chaque image n'est
+ *       ingérée qu'une fois. Puis exit.
  *
- *   - mode "continuous" (flux CONTINU — inférence au fil de l'eau) :
- *       surveille SOURCE/continuous_ingress/ en permanence et DÉPLACE les
- *       nouvelles images (avec leur label YOLO s'il existe) vers
- *       DEST/continuous_ingress/, par lots de batchSize toutes les
- *       intervalSeconds. Le déplacement vide la source : chaque fichier n'est
- *       ingéré qu'une fois. C'est le Consumer (Structured Streaming) qui
- *       détecte ensuite les fichiers déposés dans DEST.
+ *   - mode "batch" (flux hebdomadaire, lancé une fois par semaine) :
+ *       copie BRUTE, RÉCURSIVE et INTÉGRALE de SOURCE/ml_dataset/ vers
+ *       DEST/ml_dataset/ en préservant l'arborescence train/test/val (images
+ *       ET labels YOLO). Idempotent : les fichiers déjà copiés sont ignorés.
+ *       Puis exit.
  *
  * AUCUN prétraitement, AUCUNE conversion : transfert octet-à-octet.
- * NB : la boucle de veille du mode continu est le rôle même de ce service
- * (déplacement fichier) ; l'interdiction des boucles manuelles concerne le
- * moteur de streaming du Microservice 2, qui reste du Structured Streaming natif.
  *
  * Args : [sourcePath] [destPath] [batchSize] [intervalSeconds] [recursive] [mode]
  *   mode ∈ {batch, continuous} — défaut : batch
@@ -47,7 +45,7 @@ object ProducerApp {
     val sourcePath      = if (args.length > 0) args(0) else "data/source/ml_dataset"
     val destPath        = if (args.length > 1) args(1) else "data/dest/ml_dataset"
     val batchSize       = if (args.length > 2) args(2).toInt     else 100
-    val intervalSeconds = if (args.length > 3) args(3).toLong    else 5L
+    val intervalSeconds = if (args.length > 3) args(3).toLong    else 0L
     val recursive       = if (args.length > 4) args(4).toBoolean else true
     val mode            = if (args.length > 5) args(5)           else "batch"
     require(Set("batch", "continuous").contains(mode),
@@ -87,56 +85,32 @@ object ProducerApp {
       }
     }
 
-    // Label YOLO associé : .../images/foo.jpg → .../labels/foo.txt (s'il existe)
-    def labelFor(img: Path): Option[Path] = {
-      val candidate = new Path(
-        img.toString
-          .replace("/images/", "/labels/")
-          .replaceAll("(?i)\\.(jpg|jpeg|png)$", ".txt"))
-      if (srcFs.exists(candidate)) Some(candidate) else None
+    // Sélection des fichiers selon le mode :
+    //   continuous → images brutes seulement (l'ingress ne contient pas de labels)
+    //   batch      → TOUT (images + labels YOLO, arborescence intégrale)
+    val move  = mode == "continuous"
+    val files = {
+      val all = listFiles(srcFs, srcQ, recursive)
+      if (move) all.filter(_.getName.matches(ImagePattern)) else all
+    }
+    println(s"[Producer:$mode] ${files.size} fichiers à transférer depuis $srcQ")
+
+    if (files.isEmpty) {
+      println(s"[Producer:$mode] Rien à transférer — arrêt.")
+      sc.stop()
+      return
     }
 
-    mode match {
-
-      // ─── Flux HEBDOMADAIRE : copie intégrale récursive de ml_dataset ─────────
-      case "batch" =>
-        val files = listFiles(srcFs, srcQ, recursive)
-        println(s"[Producer:batch] ${files.size} fichiers trouvés dans $srcQ (recursive=$recursive)")
-        if (files.isEmpty) { println("[Producer:batch] Rien à copier — arrêt."); sc.stop(); return }
-
-        val batches = files.grouped(batchSize).toSeq
-        batches.zipWithIndex.foreach { case (batch, idx) =>
-          val copied = batch.count(transferRaw(_, move = false))
-          println(s"[Producer:batch] Lot ${idx + 1}/${batches.size} : $copied nouveaux fichiers → $destQ")
-          if (idx < batches.size - 1 && intervalSeconds > 0)
-            Thread.sleep(intervalSeconds * 1000L)
-        }
-        println(s"[Producer:batch] Terminé — arborescence ml_dataset copiée dans $destQ")
-
-      // ─── Flux CONTINU : veille de continuous_ingress, déplacement au fil de l'eau ─
-      case "continuous" =>
-        println(s"[Producer:continuous] Veille de $srcQ — lots de $batchSize toutes les ${intervalSeconds}s")
-        var running = true
-        sys.addShutdownHook { running = false }
-
-        while (running) {
-          val images = listFiles(srcFs, srcQ, recursive)
-            .filter(_.getName.matches(ImagePattern))
-            .take(batchSize)
-
-          if (images.nonEmpty) {
-            // Label déplacé AVANT son image : quand le Consumer voit l'image,
-            // le label est déjà dans DEST.
-            val moved = images.count { img =>
-              labelFor(img).foreach(transferRaw(_, move = true))
-              transferRaw(img, move = true)
-            }
-            println(s"[Producer:continuous] $moved images déplacées → $destQ")
-          }
-          Thread.sleep(math.max(1L, intervalSeconds) * 1000L)
-        }
+    // Transfert par lots puis ARRÊT — le job est éphémère dans les deux modes.
+    val batches = files.grouped(batchSize).toSeq
+    batches.zipWithIndex.foreach { case (batch, idx) =>
+      val n = batch.count(transferRaw(_, move))
+      println(s"[Producer:$mode] Lot ${idx + 1}/${batches.size} : $n fichiers → $destQ")
+      if (idx < batches.size - 1 && intervalSeconds > 0)
+        Thread.sleep(intervalSeconds * 1000L)
     }
 
+    println(s"[Producer:$mode] Terminé (${files.size} fichiers) — arrêt du job.")
     sc.stop()
   }
 }

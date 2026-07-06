@@ -3,10 +3,11 @@ main.py — Orchestrateur des DEUX temporalités du pipeline :
 
 FLUX CONTINU (défaut) — inférence au fil de l'eau :
   1. Build des fat-jars (skippé si --skip-build)
-  2. Producer mode continuous (arrière-plan) :
-       SOURCE/continuous_ingress/ → DEST/continuous_ingress/ (déplacement brut)
-  3. Consumer Structured Streaming (arrière-plan) :
-       DEST/continuous_ingress/ → staging → PREDICT → OUTPUT
+  2. Consumer Structured Streaming (arrière-plan, PERMANENT) :
+       DEST/continuous_ingress/ → staging → PREDICT (vision ONNX) → OUTPUT
+  3. Producer mode continuous : job ÉPHÉMÈRE relancé toutes les
+       --producer-every secondes (rôle de trigger) — chaque cycle déplace
+       SOURCE/continuous_ingress/ → DEST/continuous_ingress/ puis s'arrête
   4. Streamlit : dashboard → http://localhost:8501
 
 FLUX HEBDOMADAIRE (--weekly) — réentraînement du modèle :
@@ -31,6 +32,7 @@ import random
 import shutil
 import subprocess
 import sys
+import threading
 import time
 
 # Console Windows en cp1252 : évite UnicodeEncodeError sur les flèches/emoji
@@ -123,7 +125,10 @@ def build():
 
 
 def seed_ingress(n: int):
-    """Simule des arrivées : copie n images (+ labels) du set test vers SOURCE/continuous_ingress."""
+    """
+    Simule des arrivées : copie n images du set test vers SOURCE/continuous_ingress.
+    IMAGES SEULES — l'ingress ne contient jamais de label YOLO (cahier des charges).
+    """
     log(f"SEED — {n} images test → {SOURCE_INGRESS}")
     src = os.path.join(ml_source_dir(), "test", "images")
     if not os.path.isdir(src):
@@ -133,10 +138,6 @@ def seed_ingress(n: int):
     picked = random.sample(images, min(n, len(images)))
     for name in picked:
         shutil.copy2(os.path.join(src, name), os.path.join(SOURCE_INGRESS, name))
-        label = os.path.join(os.path.dirname(src), "labels",
-                             os.path.splitext(name)[0] + ".txt")
-        if os.path.exists(label):
-            shutil.copy2(label, os.path.join(SOURCE_INGRESS, os.path.basename(label)))
     print(f"[OK] {len(picked)} images déposées dans SOURCE/continuous_ingress.")
 
 
@@ -158,18 +159,30 @@ def run_training():
     print("[OK] Modèle réentraîné — le Consumer le chargera à son prochain démarrage.")
 
 
-def run_producer_continuous(batch_size: int, interval: int) -> subprocess.Popen:
-    """Flux CONTINU : veille de SOURCE/continuous_ingress, déplacement au fil de l'eau."""
-    log("CONTINU — Producer continuous (arrière-plan)")
+def run_producer_ingress(batch_size: int, interval: int):
+    """
+    Un cycle du flux CONTINU : job Producer ÉPHÉMÈRE — scanne l'ingress,
+    déplace ce qui s'y trouve par lots, puis s'arrête tout seul.
+    """
     check_jar(PRODUCER_JAR)
-    cmd = SPARK_SUBMIT_ARGS + [
+    run(SPARK_SUBMIT_ARGS + [
         "--class", "com.project.producer.ProducerApp", PRODUCER_JAR,
-        SOURCE_INGRESS, DEST_INGRESS, str(batch_size), str(max(1, interval)), "true", "continuous",
-    ]
-    print(f"[CMD] {' '.join(cmd)}")
-    proc = subprocess.Popen(cmd)
-    print(f"[INFO] Producer continuous PID : {proc.pid}")
-    return proc
+        SOURCE_INGRESS, DEST_INGRESS, str(batch_size), str(interval), "true", "continuous",
+    ])
+
+
+def producer_scheduler(stop_event: threading.Event, every: int, batch_size: int, interval: int):
+    """
+    Déclencheur du Producer continuous : le relance toutes les `every` secondes
+    (rôle du trigger externe du cahier des charges — le Producer lui-même est
+    un job batch éphémère, il ne boucle jamais).
+    """
+    while not stop_event.is_set():
+        try:
+            run_producer_ingress(batch_size, interval)
+        except subprocess.CalledProcessError as exc:
+            print(f"[WARN] Cycle Producer en échec (code {exc.returncode}) — retentera au prochain tick.")
+        stop_event.wait(every)
 
 
 def run_consumer() -> subprocess.Popen:
@@ -205,7 +218,9 @@ def main():
     parser.add_argument("--skip-build", action="store_true", help="Ne pas rebuilder les jars")
     parser.add_argument("--streamlit-only", action="store_true", help="Dashboard seulement")
     parser.add_argument("--batch-size", type=int, default=100, help="Fichiers par lot Producer")
-    parser.add_argument("--interval", type=int, default=5, help="Secondes entre lots Producer")
+    parser.add_argument("--interval", type=int, default=0, help="Secondes entre lots Producer")
+    parser.add_argument("--producer-every", type=int, default=60, metavar="S",
+                        help="Période (s) de relance du Producer continuous éphémère")
     args = parser.parse_args()
 
     ensure_dirs()
@@ -229,12 +244,19 @@ def main():
         run_training()
         return
 
-    # ─── Flux continu : producer + consumer + dashboard ──────────────────────
+    # ─── Flux continu : consumer permanent + producer relancé périodiquement ──
     if args.seed > 0:
         seed_ingress(args.seed)
 
-    producer_proc = run_producer_continuous(args.batch_size, args.interval)
     consumer_proc = run_consumer()
+
+    log(f"CONTINU — Producer éphémère relancé toutes les {args.producer_every}s")
+    stop_event = threading.Event()
+    scheduler = threading.Thread(
+        target=producer_scheduler,
+        args=(stop_event, args.producer_every, args.batch_size, args.interval),
+        daemon=True)
+    scheduler.start()
 
     print("[INFO] Attente des premières données dans data/output/ ...")
     waited = 0
@@ -254,10 +276,10 @@ def main():
     except KeyboardInterrupt:
         print("\n[STOP] Arrêt demandé.")
     finally:
+        stop_event.set()
         st_proc.terminate()
         consumer_proc.terminate()
-        producer_proc.terminate()
-        print("[STOP] Producer, Consumer et Streamlit arrêtés.")
+        print("[STOP] Scheduler Producer, Consumer et Streamlit arrêtés.")
 
 
 if __name__ == "__main__":
