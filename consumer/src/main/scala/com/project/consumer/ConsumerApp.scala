@@ -13,10 +13,14 @@ import scala.util.Try
 /**
  * Microservice 2 — Consumer & Predictor (Spark Structured Streaming + Scala).
  *
- * Args : [destPath] [stagingPath] [outputPath] [modelPath] [checkpointPath]
+ * Args : [ingressPath] [stagingPath] [outputPath] [modelPath] [checkpointPath]
+ *
+ * ingressPath = DEST/continuous_ingress/ UNIQUEMENT : le flux d'inférence est
+ * étanche vis-à-vis de DEST/ml_dataset/ (copie hebdo lue par le service ML),
+ * qui ne doit JAMAIS entrer dans le moteur de streaming.
  *
  * Ordre STRICT des étapes, dans chaque micro-batch :
- *   1. FETCH      : readStream binaryFile sur DEST/ (fichiers bruts du Producer)
+ *   1. FETCH      : readStream binaryFile sur DEST/continuous_ingress/
  *   2. PARSE +
  *      TRANSFORM  : nom / split / label YOLO → colonnes typées + features bbox
  *   3. WRITE (4)  : écriture immédiate des données propres dans STAGING/
@@ -66,9 +70,9 @@ object ConsumerApp {
       .withColumn("image_name",
         regexp_extract(col("path"), "(?i)([^/\\\\]+)\\.(jpg|jpeg|png)$", 1))
       .withColumn("split",
-        when(col("path").rlike("[/\\\\](train|valid|test)[/\\\\]"),
-             regexp_extract(col("path"), "[/\\\\](train|valid|test)[/\\\\]", 1))
-        .otherwise(lit("unknown")))
+        when(col("path").rlike("[/\\\\](train|valid|val|test)[/\\\\]"),
+             regexp_extract(col("path"), "[/\\\\](train|valid|val|test)[/\\\\]", 1))
+        .otherwise(lit("stream")))
       .withColumn("label_path", toLabelUri(col("path")))
       .withColumn("label_data", readLabel(col("label_path")))
       .withColumn("yolo_line",   explode_outer(split(trim(col("label_data")), "\n")))
@@ -96,7 +100,7 @@ object ConsumerApp {
   }
 
   def main(args: Array[String]): Unit = {
-    val destPath       = if (args.length > 0) args(0) else "data/dest"
+    val ingressPath    = if (args.length > 0) args(0) else "data/dest/continuous_ingress"
     val stagingPath    = if (args.length > 1) args(1) else "data/staging"
     val outputPath     = if (args.length > 2) args(2) else "data/output"
     val modelPath      = if (args.length > 3) args(3) else "data/models"
@@ -110,12 +114,13 @@ object ConsumerApp {
     ModelLoader.initialize(spark, modelPath.stripSuffix("/").stripSuffix("\\") + "/")
 
     // 1. FETCH — stream continu sur les fichiers bruts déposés par le Producer
+    //    dans DEST/continuous_ingress/ (jamais sur DEST/ml_dataset/)
     val rawStream = spark.readStream
       .format("binaryFile")
       .schema(Schemas.binaryFileSchema) // schéma fixe imposé par la source binaryFile
       .option("recursiveFileLookup", "true")
       .option("maxFilesPerTrigger", 100)
-      .load(destPath)
+      .load(ingressPath)
 
     val query = rawStream.writeStream
       .foreachBatch { (batchDF: DataFrame, batchId: Long) =>

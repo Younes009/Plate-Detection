@@ -1,19 +1,33 @@
 """
-main.py — Lance le pipeline complet :
-  1. Build des fat-jars (skippé si déjà présents)
-  2. Producer  : ingestion batch des images → data/dest/
-  3. Consumer  : Structured Streaming → data/output/
+main.py — Orchestrateur des DEUX temporalités du pipeline :
+
+FLUX CONTINU (défaut) — inférence au fil de l'eau :
+  1. Build des fat-jars (skippé si --skip-build)
+  2. Producer mode continuous (arrière-plan) :
+       SOURCE/continuous_ingress/ → DEST/continuous_ingress/ (déplacement brut)
+  3. Consumer Structured Streaming (arrière-plan) :
+       DEST/continuous_ingress/ → staging → PREDICT → OUTPUT
   4. Streamlit : dashboard → http://localhost:8501
 
+FLUX HEBDOMADAIRE (--weekly) — réentraînement du modèle :
+  1. Producer mode batch :
+       SOURCE/ml_dataset/ (train/test/val) → DEST/ml_dataset/ (copie récursive)
+  2. ml/train_model.py : lit DEST/ml_dataset/, entraîne, exporte .pkl + .onnx
+     dans MODEL/ et versionne les métriques (lues par l'onglet 2 du dashboard)
+
 Usage :
-    python main.py                        # pipeline complet
-    python main.py --skip-build           # skip sbt assembly
-    python main.py --skip-producer        # consumer + streamlit seulement
-    python main.py --streamlit-only       # streamlit seulement
+    python main.py                     # flux continu complet
+    python main.py --weekly            # run hebdomadaire (Producer batch + ML)
+    python main.py --seed 50           # dépose 50 images test dans SOURCE/continuous_ingress
+    python main.py --skip-build        # ne pas rebuilder les jars
+    python main.py --streamlit-only    # dashboard seulement
+
+Planification hebdo : schtasks (Windows) ou cron (Linux) sur `python main.py --weekly`.
 """
 
 import argparse
 import os
+import random
 import shutil
 import subprocess
 import sys
@@ -27,14 +41,21 @@ if hasattr(sys.stdout, "reconfigure"):
 
 # ─── Chemins ─────────────────────────────────────────────────────────────────
 
-BASE        = os.path.dirname(os.path.abspath(__file__))
-DATA        = os.path.join(BASE, "data")
-DEST        = os.path.join(DATA, "dest")
-STAGING     = os.path.join(DATA, "staging")
-OUTPUT      = os.path.join(DATA, "output")
-MODELS      = os.path.join(DATA, "models")
-CHECKPOINT  = os.path.join(DATA, "checkpoint")
-DATASET     = os.path.join(BASE, "license-plate-detection-dataset-10125-images")
+BASE = os.path.dirname(os.path.abspath(__file__))
+DATA = os.path.join(BASE, "data")
+
+SOURCE_INGRESS = os.path.join(DATA, "source", "continuous_ingress")
+SOURCE_ML      = os.path.join(DATA, "source", "ml_dataset")
+DEST_INGRESS   = os.path.join(DATA, "dest", "continuous_ingress")
+DEST_ML        = os.path.join(DATA, "dest", "ml_dataset")
+STAGING        = os.path.join(DATA, "staging")
+OUTPUT         = os.path.join(DATA, "output")
+MODELS         = os.path.join(DATA, "models")
+CHECKPOINT     = os.path.join(DATA, "checkpoint")
+
+# Si SOURCE/ml_dataset n'existe pas, le dataset livré joue ce rôle
+# (évite de dupliquer 10 000 images sur le disque).
+DATASET_FALLBACK = os.path.join(BASE, "license-plate-detection-dataset-10125-images")
 
 PRODUCER_JAR = os.path.join(BASE, "producer", "target", "scala-2.13", "producer-assembly-0.1.0.jar")
 CONSUMER_JAR = os.path.join(BASE, "consumer", "target", "scala-2.13", "consumer-assembly-0.1.0.jar")
@@ -59,7 +80,7 @@ SPARK_SUBMIT_ARGS = [
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 
 def log(msg: str):
-    print(f"\n{'='*60}\n  {msg}\n{'='*60}")
+    print(f"\n{'=' * 60}\n  {msg}\n{'=' * 60}")
 
 
 def run(cmd, **kwargs):
@@ -68,74 +89,107 @@ def run(cmd, **kwargs):
 
 
 def ensure_dirs():
-    for d in [DEST, STAGING, OUTPUT, MODELS, CHECKPOINT]:
+    for d in [SOURCE_INGRESS, DEST_INGRESS, DEST_ML, STAGING, OUTPUT, MODELS, CHECKPOINT]:
         os.makedirs(d, exist_ok=True)
+
+
+def ml_source_dir() -> str:
+    if os.path.isdir(SOURCE_ML):
+        return SOURCE_ML
+    if os.path.isdir(DATASET_FALLBACK):
+        print(f"[INFO] SOURCE/ml_dataset absent — le dataset livré joue ce rôle : {DATASET_FALLBACK}")
+        return DATASET_FALLBACK
+    print(f"[ERROR] Aucun dataset : ni {SOURCE_ML} ni {DATASET_FALLBACK}")
+    sys.exit(1)
+
+
+def check_jar(jar: str):
+    if not os.path.exists(jar):
+        print(f"[ERROR] Jar introuvable : {jar}\n  → Relance sans --skip-build")
+        sys.exit(1)
 
 
 # ─── Étapes ──────────────────────────────────────────────────────────────────
 
 def build():
-    log("STEP 1 — Build fat-jars (sbt assembly)")
+    log("BUILD — fat-jars (sbt assembly)")
     if not os.path.exists(SBT_JAR):
         print(f"[ERROR] sbt-launch.jar introuvable : {SBT_JAR}")
         sys.exit(1)
-    run(["java", "-Xmx512m", "-jar", SBT_JAR, "clean", "assembly"])
+    run(["java", "-Xmx512m", "-jar", SBT_JAR, "assembly"])
     for jar in [PRODUCER_JAR, CONSUMER_JAR]:
-        if not os.path.exists(jar):
-            print(f"[ERROR] Jar manquant après build : {jar}")
-            sys.exit(1)
+        check_jar(jar)
     print("[OK] Jars construits.")
 
 
-def run_producer(batch_size: int = 100, interval: int = 0):
-    log("STEP 2 — Producer (batch ingestion)")
-    if not os.path.exists(PRODUCER_JAR):
-        print(f"[ERROR] Producer jar introuvable : {PRODUCER_JAR}\n  → Relance sans --skip-build")
+def seed_ingress(n: int):
+    """Simule des arrivées : copie n images (+ labels) du set test vers SOURCE/continuous_ingress."""
+    log(f"SEED — {n} images test → {SOURCE_INGRESS}")
+    src = os.path.join(ml_source_dir(), "test", "images")
+    if not os.path.isdir(src):
+        print(f"[ERROR] Pas d'images test dans {src}")
         sys.exit(1)
-    if not os.path.exists(DATASET):
-        print(f"[WARN] Dataset introuvable : {DATASET}\n  → Le Producer créera le dossier source vide.")
+    images = [f for f in os.listdir(src) if f.lower().endswith((".jpg", ".jpeg", ".png"))]
+    picked = random.sample(images, min(n, len(images)))
+    for name in picked:
+        shutil.copy2(os.path.join(src, name), os.path.join(SOURCE_INGRESS, name))
+        label = os.path.join(os.path.dirname(src), "labels",
+                             os.path.splitext(name)[0] + ".txt")
+        if os.path.exists(label):
+            shutil.copy2(label, os.path.join(SOURCE_INGRESS, os.path.basename(label)))
+    print(f"[OK] {len(picked)} images déposées dans SOURCE/continuous_ingress.")
 
+
+def run_producer_batch(batch_size: int, interval: int):
+    """Flux HEBDO : copie récursive intégrale de ml_dataset (arborescence préservée)."""
+    log("HEBDO 1/2 — Producer batch : SOURCE/ml_dataset → DEST/ml_dataset")
+    check_jar(PRODUCER_JAR)
+    run(SPARK_SUBMIT_ARGS + [
+        "--class", "com.project.producer.ProducerApp", PRODUCER_JAR,
+        ml_source_dir(), DEST_ML, str(batch_size), str(interval), "true", "batch",
+    ])
+    print("[OK] Copie hebdomadaire terminée.")
+
+
+def run_training():
+    log("HEBDO 2/2 — Entraînement ML (DEST/ml_dataset → MODEL/)")
+    run([sys.executable, os.path.join(BASE, "ml", "train_model.py"),
+         "--dataset-dir", DEST_ML, "--model-dir", MODELS])
+    print("[OK] Modèle réentraîné — le Consumer le chargera à son prochain démarrage.")
+
+
+def run_producer_continuous(batch_size: int, interval: int) -> subprocess.Popen:
+    """Flux CONTINU : veille de SOURCE/continuous_ingress, déplacement au fil de l'eau."""
+    log("CONTINU — Producer continuous (arrière-plan)")
+    check_jar(PRODUCER_JAR)
     cmd = SPARK_SUBMIT_ARGS + [
-        "--class", "com.project.producer.ProducerApp",
-        PRODUCER_JAR,
-        DATASET,
-        DEST,
-        str(batch_size),
-        str(interval),
-        "true",  # récursivité
+        "--class", "com.project.producer.ProducerApp", PRODUCER_JAR,
+        SOURCE_INGRESS, DEST_INGRESS, str(batch_size), str(max(1, interval)), "true", "continuous",
     ]
-    run(cmd)
-    print("[OK] Producer terminé.")
+    print(f"[CMD] {' '.join(cmd)}")
+    proc = subprocess.Popen(cmd)
+    print(f"[INFO] Producer continuous PID : {proc.pid}")
+    return proc
 
 
-def run_consumer():
-    log("STEP 3 — Consumer (Structured Streaming) — Ctrl+C pour stopper")
-    if not os.path.exists(CONSUMER_JAR):
-        print(f"[ERROR] Consumer jar introuvable : {CONSUMER_JAR}\n  → Relance sans --skip-build")
-        sys.exit(1)
-
+def run_consumer() -> subprocess.Popen:
+    log("CONTINU — Consumer Structured Streaming (arrière-plan)")
+    check_jar(CONSUMER_JAR)
     cmd = SPARK_SUBMIT_ARGS + [
-        "--class", "com.project.consumer.ConsumerApp",
-        CONSUMER_JAR,
-        DEST,
-        STAGING,
-        OUTPUT,
-        MODELS,
-        CHECKPOINT,
+        "--class", "com.project.consumer.ConsumerApp", CONSUMER_JAR,
+        DEST_INGRESS, STAGING, OUTPUT, MODELS, CHECKPOINT,
     ]
-    # Consumer tourne indéfiniment — on le lance en arrière-plan
-    print("[INFO] Consumer lancé en arrière-plan (PID affiché ci-dessous).")
+    print(f"[CMD] {' '.join(cmd)}")
     proc = subprocess.Popen(cmd)
     print(f"[INFO] Consumer PID : {proc.pid}")
     return proc
 
 
-def run_streamlit():
-    log("STEP 4 — Streamlit dashboard → http://localhost:8501")
+def run_streamlit() -> subprocess.Popen:
+    log("CONTINU — Streamlit dashboard → http://localhost:8501")
     app = os.path.join(BASE, "streamlit", "app.py")
-    cmd = [sys.executable, "-m", "streamlit", "run", app,
-           "--server.port", "8501", "--server.headless", "false"]
-    proc = subprocess.Popen(cmd)
+    proc = subprocess.Popen([sys.executable, "-m", "streamlit", "run", app,
+                             "--server.port", "8501", "--server.headless", "false"])
     print(f"[INFO] Streamlit PID : {proc.pid}")
     return proc
 
@@ -143,12 +197,15 @@ def run_streamlit():
 # ─── Main ────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="Plate Detection — pipeline complet")
-    parser.add_argument("--skip-build",    action="store_true", help="Ne pas rebuilder les jars")
-    parser.add_argument("--skip-producer", action="store_true", help="Ne pas relancer le Producer")
-    parser.add_argument("--streamlit-only",action="store_true", help="Lancer uniquement Streamlit")
-    parser.add_argument("--batch-size",    type=int, default=100, help="Images par batch Producer (défaut 100)")
-    parser.add_argument("--interval",      type=int, default=0,   help="Secondes entre batches (défaut 0)")
+    parser = argparse.ArgumentParser(description="Plate Detection — orchestrateur pipeline")
+    parser.add_argument("--weekly", action="store_true",
+                        help="Flux hebdomadaire : Producer batch + réentraînement ML, puis exit")
+    parser.add_argument("--seed", type=int, default=0, metavar="N",
+                        help="Dépose N images test dans SOURCE/continuous_ingress (simulation)")
+    parser.add_argument("--skip-build", action="store_true", help="Ne pas rebuilder les jars")
+    parser.add_argument("--streamlit-only", action="store_true", help="Dashboard seulement")
+    parser.add_argument("--batch-size", type=int, default=100, help="Fichiers par lot Producer")
+    parser.add_argument("--interval", type=int, default=5, help="Secondes entre lots Producer")
     args = parser.parse_args()
 
     ensure_dirs()
@@ -161,23 +218,25 @@ def main():
             st_proc.terminate()
         return
 
-    # Build
     if not args.skip_build:
         build()
     else:
         print("[SKIP] Build ignoré.")
 
-    # Producer
-    if not args.skip_producer:
-        run_producer(args.batch_size, args.interval)
-    else:
-        print("[SKIP] Producer ignoré.")
+    # ─── Flux hebdomadaire : batch + réentraînement, puis exit ───────────────
+    if args.weekly:
+        run_producer_batch(args.batch_size, 0)
+        run_training()
+        return
 
-    # Consumer (background)
+    # ─── Flux continu : producer + consumer + dashboard ──────────────────────
+    if args.seed > 0:
+        seed_ingress(args.seed)
+
+    producer_proc = run_producer_continuous(args.batch_size, args.interval)
     consumer_proc = run_consumer()
 
-    # Attendre que des données apparaissent avant de lancer Streamlit
-    print("[INFO] Attente données dans data/output/ ...")
+    print("[INFO] Attente des premières données dans data/output/ ...")
     waited = 0
     while waited < 60:
         if any(f.endswith(".parquet") for _, _, files in os.walk(OUTPUT) for f in files):
@@ -186,7 +245,6 @@ def main():
         waited += 3
         print(f"  ... {waited}s")
 
-    # Streamlit (foreground — bloque jusqu'à Ctrl+C)
     st_proc = run_streamlit()
     print("\n[INFO] Dashboard : http://localhost:8501")
     print("[INFO] Ctrl+C pour tout arrêter.\n")
@@ -198,7 +256,8 @@ def main():
     finally:
         st_proc.terminate()
         consumer_proc.terminate()
-        print("[STOP] Consumer et Streamlit arrêtés.")
+        producer_proc.terminate()
+        print("[STOP] Producer, Consumer et Streamlit arrêtés.")
 
 
 if __name__ == "__main__":
