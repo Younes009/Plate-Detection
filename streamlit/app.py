@@ -1,23 +1,37 @@
 """
 Dashboard Streamlit — LECTURE SEULE, en continu (READ 8).
 
-Lit les Parquet de OUTPUT/ (écrits par ConsumerApp) via pandas + pyarrow,
-et se rafraîchit automatiquement pour suivre le stream en temps réel.
+Deux onglets, conformes au cahier des charges :
+  1. Suivi des prédictions & du flux : Pipeline Tracker de bout en bout
+     (SOURCE → DEST → OUTPUT), table de traçabilité par fichier avec statut
+     (Reçu / En cours / Traité), prédictions et score de confiance.
+  2. Suivi de l'entraînement : modèle actif (version, date, volume dataset),
+     métriques du dernier run hebdo (accuracy, F1, matrice de confusion
+     test/val) et évolution historique de la précision.
+
 Les octets images (image_data) ne sont jamais chargés depuis les Parquet ;
-la galerie ouvre les fichiers images directement sur disque via image_path.
+l'aperçu ouvre les fichiers images directement sur disque via image_path.
 """
 
 import glob
+import json
 import os
 import urllib.parse
 import urllib.request
+from datetime import datetime
 
 import altair as alt
 import pandas as pd
 import streamlit as st
 
 _BASE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
-OUTPUT_PATH = os.path.join(_BASE, "output")
+SOURCE_INGRESS = os.path.join(_BASE, "source", "continuous_ingress")
+DEST_INGRESS   = os.path.join(_BASE, "dest", "continuous_ingress")
+OUTPUT_PATH    = os.path.join(_BASE, "output")
+METRICS_PATH   = os.path.join(_BASE, "models", "metrics")
+MODELS_PATH    = os.path.join(_BASE, "models")
+
+IMAGE_EXTS = (".jpg", ".jpeg", ".png")
 
 # Colonnes lues depuis OUTPUT/ — image_data (binaire lourd) volontairement exclue
 READ_COLUMNS = [
@@ -28,23 +42,24 @@ READ_COLUMNS = [
     "prediction", "confidence_score", "processed_at",
 ]
 
-TABLE_COLUMNS = [
-    "image_name", "split", "prediction", "confidence_score",
-    "bbox_area_norm", "aspect_ratio", "processed_at",
-]
-
 PRED_COLORS = {"plate": "#2ecc71", "background": "#95a5a6", "uncertain": "#f39c12"}
+STATUS_ORDER = ["Reçu", "En cours", "Traité"]
 
 
-def _parquet_files(directory: str):
-    return glob.glob(os.path.join(directory, "**", "*.parquet"), recursive=True)
+# ─── Chargement des données ──────────────────────────────────────────────────
+
+def _image_files(directory: str):
+    if not os.path.isdir(directory):
+        return []
+    return [p for p in glob.glob(os.path.join(directory, "**", "*"), recursive=True)
+            if p.lower().endswith(IMAGE_EXTS)]
 
 
 @st.cache_data(ttl=30, show_spinner="Lecture des Parquet…")
 def load_output() -> pd.DataFrame:
-    files = _parquet_files(OUTPUT_PATH)
+    files = glob.glob(os.path.join(OUTPUT_PATH, "**", "*.parquet"), recursive=True)
     if not files:
-        return pd.DataFrame()
+        return pd.DataFrame(columns=READ_COLUMNS)
     frames = []
     for f in files:
         try:
@@ -55,6 +70,19 @@ def load_output() -> pd.DataFrame:
             frames.append(df[[c for c in READ_COLUMNS if c in df.columns]])
     # reindex : garantit toutes les colonnes attendues (NaN si schéma ancien)
     return pd.concat(frames, ignore_index=True).reindex(columns=READ_COLUMNS)
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def load_metrics_history() -> list:
+    """Runs hebdo triés du plus ancien au plus récent (MODEL/metrics/*.json)."""
+    runs = []
+    for path in glob.glob(os.path.join(METRICS_PATH, "*.json")):
+        try:
+            with open(path, encoding="utf-8") as f:
+                runs.append(json.load(f))
+        except (OSError, json.JSONDecodeError):
+            continue
+    return sorted(runs, key=lambda r: r.get("trained_at", ""))
 
 
 def uri_to_path(uri: str):
@@ -77,43 +105,67 @@ def load_image_with_boxes(path: str, boxes: tuple):
     w, h = img.size
     draw = ImageDraw.Draw(img)
     for cx, cy, bw, bh in boxes:
-        x0 = (cx - bw / 2) * w
-        y0 = (cy - bh / 2) * h
-        x1 = (cx + bw / 2) * w
-        y1 = (cy + bh / 2) * h
+        x0, y0 = (cx - bw / 2) * w, (cy - bh / 2) * h
+        x1, y1 = (cx + bw / 2) * w, (cy + bh / 2) * h
         draw.rectangle([x0, y0, x1, y1], outline="#2ecc71", width=max(2, int(w / 200)))
     return img
 
 
-def pred_chart(series: pd.Series) -> alt.Chart:
-    counts = series.value_counts().rename_axis("prediction").reset_index(name="count")
-    return (
-        alt.Chart(counts)
-        .mark_bar(cornerRadiusEnd=4)
-        .encode(
-            x=alt.X("count:Q", title="Nombre de lignes"),
-            y=alt.Y("prediction:N", sort="-x", title=None),
-            color=alt.Color(
-                "prediction:N", legend=None,
-                scale=alt.Scale(domain=list(PRED_COLORS), range=list(PRED_COLORS.values())),
-            ),
-            tooltip=["prediction", "count"],
-        )
-        .properties(height=180)
-    )
+def build_traceability(output_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Lineage par fichier :
+      Reçu     = image encore dans SOURCE/continuous_ingress (en attente Producer)
+      En cours = image dans DEST/continuous_ingress, pas encore dans OUTPUT
+      Traité   = image présente dans OUTPUT avec prédiction + score
+    """
+    rows = []
+    processed = set(output_df["image_name"].dropna()) if not output_df.empty else set()
+
+    for path in _image_files(SOURCE_INGRESS):
+        rows.append({"fichier": os.path.basename(path), "statut": "Reçu",
+                     "timestamp": datetime.fromtimestamp(os.path.getmtime(path)),
+                     "prediction": None, "confidence_score": None})
+
+    for path in _image_files(DEST_INGRESS):
+        name = os.path.splitext(os.path.basename(path))[0]
+        if name in processed:
+            continue  # apparaîtra en "Traité" via OUTPUT
+        rows.append({"fichier": os.path.basename(path), "statut": "En cours",
+                     "timestamp": datetime.fromtimestamp(os.path.getmtime(path)),
+                     "prediction": None, "confidence_score": None})
+
+    if not output_df.empty:
+        done = (output_df.sort_values("processed_at")
+                .drop_duplicates("image_name", keep="last"))
+        for _, r in done.iterrows():
+            rows.append({"fichier": str(r["image_name"]), "statut": "Traité",
+                         "timestamp": pd.to_datetime(r["processed_at"]),
+                         "prediction": r["prediction"],
+                         "confidence_score": r["confidence_score"]})
+
+    if not rows:
+        return pd.DataFrame(columns=["fichier", "statut", "timestamp",
+                                     "prediction", "confidence_score"])
+    df = pd.DataFrame(rows)
+    df["timestamp"] = pd.to_datetime(df["timestamp"])
+    return df.sort_values("timestamp", ascending=False)
 
 
-def histogram(df: pd.DataFrame, col: str, title: str, maxbins: int = 30) -> alt.Chart:
-    return (
-        alt.Chart(df[[col]].dropna())
-        .mark_bar(color="#4c78a8", cornerRadiusEnd=2)
-        .encode(
-            x=alt.X(f"{col}:Q", bin=alt.Bin(maxbins=maxbins), title=title),
-            y=alt.Y("count()", title="Lignes"),
-            tooltip=["count()"],
-        )
-        .properties(height=220)
+def confusion_chart(matrix: list, title: str) -> alt.Chart:
+    labels = ["background", "plate"]
+    records = [{"réel": labels[i], "prédit": labels[j], "n": matrix[i][j]}
+               for i in range(2) for j in range(2)]
+    base = alt.Chart(pd.DataFrame(records)).properties(height=220, title=title)
+    heat = base.mark_rect().encode(
+        x=alt.X("prédit:N", title="Prédit"),
+        y=alt.Y("réel:N", title="Réel"),
+        color=alt.Color("n:Q", scale=alt.Scale(scheme="greens"), legend=None),
     )
+    text = base.mark_text(fontSize=18, fontWeight="bold").encode(
+        x="prédit:N", y="réel:N", text="n:Q",
+        color=alt.condition("datum.n > 100", alt.value("white"), alt.value("#2ecc71")),
+    )
+    return heat + text
 
 
 # ─── Page ────────────────────────────────────────────────────────────────────
@@ -125,25 +177,21 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-st.title("🚘 Plate Detection — Dashboard temps réel")
-
-# ─── Sidebar : rafraîchissement + filtres ────────────────────────────────────
+st.title("🚘 Plate Detection — Pipeline temps réel")
 
 with st.sidebar:
     st.header("⚙️ Contrôles")
     auto_refresh = st.toggle("Auto-refresh", value=True,
-                             help="Relit data/output/ périodiquement sans bloquer l'interface.")
+                             help="Relit le pipeline périodiquement sans bloquer l'interface.")
     refresh_seconds = st.slider("Intervalle (secondes)", 5, 120, 30, 5,
                                 disabled=not auto_refresh)
     if st.button("🔄 Rafraîchir maintenant", width="stretch"):
         st.cache_data.clear()
         st.rerun()
-
-try:
-    data = load_output()
-except Exception as exc:
-    st.error(f"Impossible de lire `{OUTPUT_PATH}` : {exc}")
-    st.stop()
+    st.divider()
+    st.caption(f"📂 SOURCE : `{SOURCE_INGRESS}`")
+    st.caption(f"📂 DEST : `{DEST_INGRESS}`")
+    st.caption(f"📂 OUTPUT : `{OUTPUT_PATH}`")
 
 # Rafraîchissement non bloquant : le fragment se réveille tout seul et
 # déclenche un rerun global — l'UI reste interactive entre deux ticks.
@@ -156,220 +204,215 @@ if auto_refresh:
     def _tick():
         st.caption(f"⏱️ Auto-refresh actif — toutes les {refresh_seconds}s")
         if st.session_state.get("_tick_armed"):
-            load_output.clear()
+            st.cache_data.clear()
             st.rerun(scope="app")
         st.session_state["_tick_armed"] = True
 
     _tick()
 
-if data.empty:
-    st.info(
-        "**Aucune donnée dans `data/output/` pour le moment.**\n\n"
-        "1. Lancer le Producer : `python main.py` (ou `--skip-build`)\n"
-        "2. Le Consumer écrit les premiers Parquet après ~10 s de streaming\n"
-        "3. Ce dashboard se mettra à jour automatiquement"
-    )
+try:
+    output_df = load_output()
+except Exception as exc:
+    st.error(f"Impossible de lire `{OUTPUT_PATH}` : {exc}")
     st.stop()
 
-with st.sidebar:
-    st.divider()
-    st.header("🔍 Filtres")
-    splits = sorted(data["split"].dropna().unique().tolist())
-    predictions = sorted(data["prediction"].dropna().unique().tolist())
+tab_flux, tab_training = st.tabs(
+    ["📡 Suivi des prédictions & du flux", "🧠 Suivi de l'entraînement"])
 
-    selected_splits = st.multiselect("Split", splits, default=splits)
-    selected_preds = st.multiselect("Prédiction", predictions, default=predictions)
-    min_conf = st.slider("Confidence minimum", 0.0, 1.0, 0.0, 0.05)
-    has_label = st.checkbox("Images avec label seulement", value=False)
+# ═══ Onglet 1 — Pipeline Tracker + traçabilité ═══════════════════════════════
 
-    st.divider()
-    st.caption(f"📂 Source : `{OUTPUT_PATH}`")
+with tab_flux:
+    st.subheader("Pipeline Tracker — lineage de bout en bout")
 
-mask = (
-    data["split"].isin(selected_splits)
-    & data["prediction"].isin(selected_preds)
-    & (data["confidence_score"] >= min_conf)
-)
-if has_label:
-    mask &= data["class_id"].notna()
+    n_source = len(_image_files(SOURCE_INGRESS))
+    n_dest_total = len(_image_files(DEST_INGRESS))
+    n_done = output_df["image_name"].nunique() if not output_df.empty else 0
+    n_transit = max(0, n_dest_total - n_done)
 
-filtered = data[mask]
-labeled = filtered[filtered["class_id"].notna()]
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("📥 En attente (SOURCE)", f"{n_source:,}",
+              help="Images déposées dans SOURCE/continuous_ingress, pas encore ingérées.")
+    c2.metric("🚚 En transit (DEST)", f"{n_transit:,}",
+              help="Images déplacées par le Producer, pas encore traitées par le Consumer.")
+    c3.metric("✅ Traités (OUTPUT)", f"{n_done:,}",
+              help="Images passées par tout le pipeline, prédiction disponible.")
+    c4.metric("🎯 Confidence moyenne",
+              f"{output_df['confidence_score'].mean():.3f}" if n_done else "—")
 
-if filtered.empty:
-    st.warning("Aucune ligne ne correspond aux filtres. Élargir la sélection dans la sidebar.")
-    st.stop()
+    # Barre de progression du flux
+    total_seen = n_source + n_transit + n_done
+    if total_seen:
+        st.progress(n_done / total_seen,
+                    text=f"{n_done}/{total_seen} fichiers arrivés au bout du pipeline")
 
-# ─── Bandeau statut ──────────────────────────────────────────────────────────
-
-last_ts = pd.to_datetime(data["processed_at"]).max()
-st.caption(
-    f"**{len(data):,}** lignes en base · **{data['image_name'].nunique():,}** images · "
-    f"dernier traitement : **{last_ts:%d/%m/%Y %H:%M:%S}**"
-)
-
-# ─── KPIs ────────────────────────────────────────────────────────────────────
-
-k1, k2, k3, k4 = st.columns(4)
-k1.metric("Lignes filtrées (1/bbox)", f"{len(filtered):,}")
-k2.metric("Images distinctes", f"{filtered['image_name'].nunique():,}")
-k3.metric("Confidence moyenne",
-          f"{filtered['confidence_score'].mean():.3f}" if len(filtered) else "—")
-k4.metric("Bbox YOLO (ground truth)", f"{int(filtered['class_id'].notna().sum()):,}")
-
-# ─── Tabs ────────────────────────────────────────────────────────────────────
-
-tab_overview, tab_bbox, tab_gallery, tab_data = st.tabs(
-    ["📊 Vue d'ensemble", "📐 Analyse bbox", "🖼️ Galerie", "🗃️ Données"])
-
-with tab_overview:
-    c1, c2 = st.columns(2)
-    with c1:
-        st.subheader("Prédictions")
-        st.altair_chart(pred_chart(filtered["prediction"]), width="stretch")
-    with c2:
-        st.subheader("Répartition par split")
-        split_counts = filtered["split"].value_counts().rename_axis("split").reset_index(name="count")
-        st.altair_chart(
-            alt.Chart(split_counts)
-            .mark_bar(cornerRadiusEnd=4, color="#4c78a8")
-            .encode(
-                x=alt.X("count:Q", title="Nombre de lignes"),
-                y=alt.Y("split:N", sort="-x", title=None),
-                tooltip=["split", "count"],
-            )
-            .properties(height=180),
-            width="stretch",
-        )
-
-    st.subheader("Distribution des confidence scores")
-    st.altair_chart(histogram(filtered, "confidence_score", "Confidence score", maxbins=20),
-                    width="stretch")
-
-    st.subheader("Débit du stream (images traitées / minute)")
-    throughput = (
-        filtered.assign(minute=pd.to_datetime(filtered["processed_at"]).dt.floor("min"))
-        .groupby("minute")["image_name"].nunique()
-        .rename("images").reset_index()
-    )
-    st.altair_chart(
-        alt.Chart(throughput)
-        .mark_area(color="#4c78a8", opacity=0.6, line={"color": "#4c78a8"})
-        .encode(
-            x=alt.X("minute:T", title="Heure de traitement"),
-            y=alt.Y("images:Q", title="Images / minute"),
-            tooltip=[alt.Tooltip("minute:T", format="%H:%M"), "images"],
-        )
-        .properties(height=200),
-        width="stretch",
-    )
-
-with tab_bbox:
-    if labeled.empty:
-        st.info("Aucune bbox ground truth dans la sélection courante.")
+    st.subheader("Traçabilité des fichiers")
+    trace = build_traceability(output_df)
+    if trace.empty:
+        st.info("**Aucun fichier vu par le pipeline pour le moment.**\n\n"
+                "Déposer des images dans `SOURCE/continuous_ingress/` "
+                "(ou `python main.py --seed 50`), le Producer les déplacera "
+                "et le Consumer les traitera automatiquement.")
     else:
-        b1, b2, b3 = st.columns(3)
-        b1.metric("Total bbox", f"{len(labeled):,}")
-        b2.metric("Aire moyenne (norm.)", f"{labeled['bbox_area_norm'].mean():.4f}")
-        b3.metric("Ratio largeur/hauteur moyen", f"{labeled['aspect_ratio'].mean():.2f}")
-
-        h1, h2 = st.columns(2)
-        with h1:
-            st.subheader("Aire des bbox")
-            st.altair_chart(histogram(labeled, "bbox_area_norm", "Aire normalisée"),
-                            width="stretch")
-        with h2:
-            st.subheader("Aspect ratio")
-            st.altair_chart(histogram(labeled, "aspect_ratio", "Largeur / hauteur"),
-                            width="stretch")
-
-        st.subheader("Position des centres de bbox dans l'image")
-        st.caption("Chaque point est une plaque ; (0,0) = coin haut-gauche de l'image.")
-        st.altair_chart(
-            alt.Chart(labeled[["cx_norm", "cy_norm", "bbox_area_norm"]].dropna())
-            .mark_circle(opacity=0.35, color="#e45756")
-            .encode(
-                x=alt.X("cx_norm:Q", title="Centre X (normalisé)",
-                        scale=alt.Scale(domain=[0, 1])),
-                y=alt.Y("cy_norm:Q", title="Centre Y (normalisé)",
-                        scale=alt.Scale(domain=[0, 1], reverse=True)),
-                size=alt.Size("bbox_area_norm:Q", legend=None),
-                tooltip=[alt.Tooltip("cx_norm:Q", format=".2f"),
-                         alt.Tooltip("cy_norm:Q", format=".2f")],
-            )
-            .properties(height=380),
-            width="stretch",
+        f1, f2 = st.columns([1, 3])
+        with f1:
+            statut_filter = st.multiselect("Statut", STATUS_ORDER, default=STATUS_ORDER)
+        shown = trace[trace["statut"].isin(statut_filter)].head(300)
+        st.dataframe(
+            shown, width="stretch", hide_index=True,
+            column_config={
+                "fichier": st.column_config.TextColumn("Fichier"),
+                "statut": st.column_config.TextColumn("Statut"),
+                "timestamp": st.column_config.DatetimeColumn("Horodatage",
+                                                             format="DD/MM HH:mm:ss"),
+                "prediction": st.column_config.TextColumn("Prédiction"),
+                "confidence_score": st.column_config.ProgressColumn(
+                    "Confidence", format="%.2f", min_value=0.0, max_value=1.0),
+            },
         )
 
-with tab_gallery:
-    st.caption("Images lues directement sur disque via `image_path` — "
-               "bbox ground truth dessinées en vert.")
-    n_images = st.slider("Nombre d'images affichées", 4, 24, 8, 4)
+    if not output_df.empty:
+        st.subheader("Prédictions du flux")
+        g1, g2 = st.columns(2)
+        with g1:
+            counts = (output_df["prediction"].value_counts()
+                      .rename_axis("prediction").reset_index(name="n"))
+            st.altair_chart(
+                alt.Chart(counts).mark_bar(cornerRadiusEnd=4).encode(
+                    x=alt.X("n:Q", title="Lignes"),
+                    y=alt.Y("prediction:N", sort="-x", title=None),
+                    color=alt.Color("prediction:N", legend=None,
+                                    scale=alt.Scale(domain=list(PRED_COLORS),
+                                                    range=list(PRED_COLORS.values()))),
+                    tooltip=["prediction", "n"],
+                ).properties(height=180),
+                width="stretch")
+        with g2:
+            st.altair_chart(
+                alt.Chart(output_df[["confidence_score"]].dropna())
+                .mark_bar(color="#4c78a8", cornerRadiusEnd=2)
+                .encode(
+                    x=alt.X("confidence_score:Q", bin=alt.Bin(maxbins=20),
+                            title="Confidence score"),
+                    y=alt.Y("count()", title="Lignes"),
+                ).properties(height=180),
+                width="stretch")
 
-    with_boxes = filtered.dropna(subset=["cx_norm"])
-    boxes_by_image = {
-        name: tuple(zip(g["cx_norm"], g["cy_norm"], g["w_norm"], g["h_norm"]))
-        for name, g in with_boxes.groupby("image_name")
-    }
-    gallery = (
-        filtered.dropna(subset=["image_path"])
-        .drop_duplicates("image_name")
-        .head(n_images)
-    )
+        throughput = (
+            output_df.assign(minute=pd.to_datetime(output_df["processed_at"]).dt.floor("min"))
+            .groupby("minute")["image_name"].nunique().rename("images").reset_index())
+        st.altair_chart(
+            alt.Chart(throughput)
+            .mark_area(color="#4c78a8", opacity=0.6, line={"color": "#4c78a8"})
+            .encode(x=alt.X("minute:T", title="Heure de traitement"),
+                    y=alt.Y("images:Q", title="Images / minute"),
+                    tooltip=[alt.Tooltip("minute:T", format="%H:%M"), "images"])
+            .properties(height=180, title="Débit du stream"),
+            width="stretch")
 
-    if gallery.empty:
-        st.info("Aucune image disponible dans la sélection courante.")
-    else:
-        cols = st.columns(4)
-        shown = 0
-        for _, row in gallery.iterrows():
-            local = uri_to_path(row["image_path"])
-            if not local:
-                continue
-            boxes = boxes_by_image.get(row["image_name"], ())
-            with cols[shown % 4]:
-                try:
-                    img = load_image_with_boxes(local, boxes)
-                except Exception:
+        with st.expander("🖼️ Aperçu des dernières images traitées (bbox ground truth)"):
+            recent = (output_df.dropna(subset=["image_path"])
+                      .sort_values("processed_at", ascending=False)
+                      .drop_duplicates("image_name").head(8))
+            boxes_by_image = {
+                name: tuple(zip(g["cx_norm"], g["cy_norm"], g["w_norm"], g["h_norm"]))
+                for name, g in output_df.dropna(subset=["cx_norm"]).groupby("image_name")
+            }
+            cols, shown_imgs = st.columns(4), 0
+            for _, row in recent.iterrows():
+                local = uri_to_path(row["image_path"])
+                if not local:
                     continue
-                badge = PRED_COLORS.get(row["prediction"], "#95a5a6")
-                st.image(img, width="stretch")
-                st.markdown(
-                    f"<div style='margin-top:-8px'><code>{row['image_name']}</code><br>"
-                    f"<span style='color:{badge};font-weight:600'>{row['prediction']}</span>"
-                    f" · conf {row['confidence_score']:.2f}"
-                    f" · {len(boxes)} bbox</div>",
-                    unsafe_allow_html=True,
-                )
-            shown += 1
-        if shown == 0:
-            st.warning("Chemins images introuvables sur ce disque "
-                       "(dataset déplacé ou dashboard lancé sur une autre machine).")
+                boxes = boxes_by_image.get(row["image_name"], ())
+                with cols[shown_imgs % 4]:
+                    try:
+                        st.image(load_image_with_boxes(local, boxes), width="stretch")
+                    except Exception:
+                        continue
+                    badge = PRED_COLORS.get(row["prediction"], "#95a5a6")
+                    st.markdown(
+                        f"<code>{row['image_name']}</code><br>"
+                        f"<span style='color:{badge};font-weight:600'>{row['prediction']}</span>"
+                        f" · conf {row['confidence_score']:.2f}",
+                        unsafe_allow_html=True)
+                shown_imgs += 1
 
-with tab_data:
-    st.subheader(f"Données enrichies — {len(filtered):,} lignes")
-    st.dataframe(
-        filtered[[c for c in TABLE_COLUMNS if c in filtered.columns]],
-        width="stretch",
-        hide_index=True,
-        column_config={
-            "image_name": st.column_config.TextColumn("Image"),
-            "split": st.column_config.TextColumn("Split"),
-            "prediction": st.column_config.TextColumn("Prédiction"),
-            "confidence_score": st.column_config.ProgressColumn(
-                "Confidence", format="%.2f", min_value=0.0, max_value=1.0),
-            "bbox_area_norm": st.column_config.NumberColumn("Aire bbox", format="%.4f"),
-            "aspect_ratio": st.column_config.NumberColumn("Aspect ratio", format="%.2f"),
-            "processed_at": st.column_config.DatetimeColumn("Traité le", format="DD/MM HH:mm:ss"),
-        },
-    )
-    st.download_button(
-        "⬇️ Exporter la sélection (CSV)",
-        filtered[[c for c in TABLE_COLUMNS if c in filtered.columns]].to_csv(index=False),
-        file_name="plate_detection_export.csv",
-        mime="text/csv",
-    )
+# ═══ Onglet 2 — Suivi de l'entraînement ══════════════════════════════════════
 
-    with st.expander("Détail labels YOLO (texte brut)"):
-        sample = filtered[filtered["label_data"].notna()][["image_name", "label_data"]].head(20)
-        st.dataframe(sample, width="stretch", hide_index=True)
+with tab_training:
+    runs = load_metrics_history()
+
+    if not runs:
+        st.info("**Aucun run d'entraînement enregistré.**\n\n"
+                "Lancer le flux hebdomadaire : `python main.py --weekly` — "
+                "le Producer copiera `SOURCE/ml_dataset/` vers `DEST/ml_dataset/`, "
+                "puis le service ML entraînera le modèle et déposera ses métriques ici.")
+    else:
+        last = runs[-1]
+        trained_at = pd.to_datetime(last.get("trained_at"))
+
+        st.subheader("Modèle actif")
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Version", last.get("version", "—"))
+        m2.metric("Dernier run hebdo", f"{trained_at:%d/%m/%Y %H:%M}" if trained_at else "—")
+        m3.metric("Volume dataset (images)", f"{last.get('dataset_images', 0):,}")
+        m4.metric("Runs enregistrés", len(runs))
+
+        pkl_ok = os.path.exists(os.path.join(MODELS_PATH, "plate_model.pkl"))
+        onnx_ok = os.path.exists(os.path.join(MODELS_PATH, "plate_model.onnx"))
+        st.caption(
+            f"Artefacts : plate_model.pkl {'✅' if pkl_ok else '❌'} · "
+            f"plate_model.onnx {'✅' if onnx_ok else '❌'} · "
+            f"répartition : {last.get('split_counts', {})}")
+
+        st.subheader("Performance du dernier entraînement")
+        metrics = last.get("metrics", {})
+        if not metrics:
+            st.warning("Run enregistré sans métriques (sets test/val vides ?).")
+        else:
+            kpi_cols = st.columns(2 * max(1, len(metrics)))
+            for i, (split, m) in enumerate(metrics.items()):
+                kpi_cols[2 * i].metric(f"Accuracy ({split})", f"{m['accuracy']:.3f}")
+                kpi_cols[2 * i + 1].metric(f"F1-score ({split})", f"{m['f1_score']:.3f}")
+
+            cm_cols = st.columns(max(1, len(metrics)))
+            for i, (split, m) in enumerate(metrics.items()):
+                with cm_cols[i]:
+                    st.altair_chart(
+                        confusion_chart(m["confusion_matrix"],
+                                        f"Matrice de confusion — {split} "
+                                        f"(n={m['n_samples']:,})"),
+                        width="stretch")
+
+        if last.get("feature_importances"):
+            fi = (pd.Series(last["feature_importances"])
+                  .rename_axis("feature").reset_index(name="importance"))
+            st.altair_chart(
+                alt.Chart(fi).mark_bar(color="#4c78a8", cornerRadiusEnd=4).encode(
+                    x=alt.X("importance:Q"),
+                    y=alt.Y("feature:N", sort="-x", title=None),
+                    tooltip=["feature", "importance"],
+                ).properties(height=200, title="Importance des features"),
+                width="stretch")
+
+        st.subheader("Évolution historique de la précision")
+        history = [
+            {"version": r["version"], "trained_at": r["trained_at"],
+             "split": split, "accuracy": m["accuracy"], "f1": m["f1_score"]}
+            for r in runs for split, m in r.get("metrics", {}).items()
+        ]
+        if len(history) < 2:
+            st.caption("L'historique se remplira au fil des runs hebdomadaires.")
+        if history:
+            hist_df = pd.DataFrame(history)
+            hist_df["trained_at"] = pd.to_datetime(hist_df["trained_at"])
+            st.altair_chart(
+                alt.Chart(hist_df)
+                .mark_line(point=True)
+                .encode(
+                    x=alt.X("trained_at:T", title="Date du run"),
+                    y=alt.Y("accuracy:Q", title="Accuracy",
+                            scale=alt.Scale(domain=[0, 1])),
+                    color=alt.Color("split:N", title="Set"),
+                    tooltip=["version", "split", "accuracy", "f1"],
+                ).properties(height=260),
+                width="stretch")
