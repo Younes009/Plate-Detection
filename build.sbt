@@ -1,8 +1,12 @@
 ThisBuild / scalaVersion := "2.13.14"
 ThisBuild / version      := "0.1.0"
 
+// Doit matcher la version du spark-submit installé (spark-submit --version)
 val sparkVersion       = "4.1.1"
-val onnxRuntimeVersion = "1.18.0"
+// ≥ 1.20 requis : les modèles exportés par skl2onnx/onnx récents (IR v10+)
+// ne se chargent pas avec onnxruntime 1.18. 1.22 : DLL native ne s'initialise
+// pas sur cette machine (UnsatisfiedLinkError).
+val onnxRuntimeVersion = "1.20.0"
 
 lazy val commonSettings = Seq(
   libraryDependencies ++= Seq(
@@ -14,6 +18,9 @@ lazy val commonSettings = Seq(
   assembly / assemblyMergeStrategy := {
     case PathList("META-INF", "MANIFEST.MF")          => MergeStrategy.discard
     case PathList("META-INF", "native-image", _*)     => MergeStrategy.discard
+    // Les fichiers services/ enregistrent les DataSource et les loaders natifs ONNX :
+    // les concaténer au lieu de les jeter, sinon ClassNotFound au runtime.
+    case PathList("META-INF", "services", _*)         => MergeStrategy.filterDistinctLines
     case PathList("META-INF", xs @ _*)                => MergeStrategy.discard
     case x if x.endsWith(".proto")                    => MergeStrategy.first
     case x if x.endsWith(".so") || x.endsWith(".dll") => MergeStrategy.first

@@ -14,15 +14,23 @@ Usage :
 
 import argparse
 import os
+import shutil
 import subprocess
 import sys
 import time
+
+# Console Windows en cp1252 : évite UnicodeEncodeError sur les flèches/emoji
+# quand stdout est redirigé (fichier, CI, tâche en arrière-plan).
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 # ─── Chemins ─────────────────────────────────────────────────────────────────
 
 BASE        = os.path.dirname(os.path.abspath(__file__))
 DATA        = os.path.join(BASE, "data")
 DEST        = os.path.join(DATA, "dest")
+STAGING     = os.path.join(DATA, "staging")
 OUTPUT      = os.path.join(DATA, "output")
 MODELS      = os.path.join(DATA, "models")
 CHECKPOINT  = os.path.join(DATA, "checkpoint")
@@ -32,11 +40,19 @@ PRODUCER_JAR = os.path.join(BASE, "producer", "target", "scala-2.13", "producer-
 CONSUMER_JAR = os.path.join(BASE, "consumer", "target", "scala-2.13", "consumer-assembly-0.1.0.jar")
 SBT_JAR      = os.path.join(BASE, "sbt-launch.jar")
 
+# shutil.which résout spark-submit.cmd sous Windows (Popen ne le fait pas seul)
+SPARK_SUBMIT = shutil.which("spark-submit") or "spark-submit"
+
 SPARK_SUBMIT_ARGS = [
-    "spark-submit",
+    SPARK_SUBMIT,
     "--master", "local[4]",
     "--driver-memory", "2g",
     "--conf", "spark.driver.extraJavaOptions=-Djava.awt.headless=true",
+    # Force le loopback : sinon Spark se bind sur un adaptateur virtuel
+    # (VPN/WSL/VMware) et les RPC driver<->executor sont coupés sous Windows.
+    "--conf", "spark.driver.bindAddress=127.0.0.1",
+    "--conf", "spark.driver.host=localhost",
+    "--conf", "spark.network.timeout=300s",
 ]
 
 
@@ -52,7 +68,7 @@ def run(cmd, **kwargs):
 
 
 def ensure_dirs():
-    for d in [DEST, OUTPUT, MODELS, CHECKPOINT]:
+    for d in [DEST, STAGING, OUTPUT, MODELS, CHECKPOINT]:
         os.makedirs(d, exist_ok=True)
 
 
@@ -86,6 +102,7 @@ def run_producer(batch_size: int = 100, interval: int = 0):
         DEST,
         str(batch_size),
         str(interval),
+        "true",  # récursivité
     ]
     run(cmd)
     print("[OK] Producer terminé.")
@@ -101,6 +118,7 @@ def run_consumer():
         "--class", "com.project.consumer.ConsumerApp",
         CONSUMER_JAR,
         DEST,
+        STAGING,
         OUTPUT,
         MODELS,
         CHECKPOINT,

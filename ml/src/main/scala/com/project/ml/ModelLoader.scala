@@ -111,7 +111,7 @@ object ModelLoader {
       val env     = ai.onnxruntime.OrtEnvironment.getEnvironment()
       val session = env.createSession(bc.value, new ai.onnxruntime.OrtSession.SessionOptions())
 
-      rows.map { row =>
+      val scoredRows = rows.map { row =>
         val (pred, conf) = Try {
           val imgBytes = row.getAs[Array[Byte]]("image_data")
           if (imgBytes == null || imgBytes.isEmpty) ("uncertain", 0.0)
@@ -142,6 +142,8 @@ object ModelLoader {
 
         Row.fromSeq(row.toSeq ++ Seq(pred, conf))
       }
+      // Ferme la session ONNX une fois la partition entièrement consommée
+      scoredRows ++ { session.close(); Iterator.empty }
     }
     spark.createDataFrame(rdd, outputSchema)
   }
@@ -176,6 +178,12 @@ object ModelLoader {
   // Entrée   : 6 features bbox (bbox_area_norm, aspect_ratio, cx_norm, cy_norm, w_norm, h_norm)
   // Sortie   : output_label (Long) + output_probability (Array[Array[Float]], zipmap=False)
 
+  private def firstOutput(result: ai.onnxruntime.OrtSession.Result,
+                          names: String*): ai.onnxruntime.OnnxValue =
+    names.iterator.map(result.get(_)).find(_.isPresent).map(_.get())
+      .getOrElse(throw new NoSuchElementException(
+        s"Sorties ONNX absentes : ${names.mkString(", ")}"))
+
   private def scoreWithSklearnOnnx(df: DataFrame, bc: Broadcast[Array[Byte]]): DataFrame = {
     val spark = df.sparkSession
     val outputSchema = df.schema
@@ -186,7 +194,7 @@ object ModelLoader {
       val env     = ai.onnxruntime.OrtEnvironment.getEnvironment()
       val session = env.createSession(bc.value, new ai.onnxruntime.OrtSession.SessionOptions())
 
-      rows.map { row =>
+      val scoredRows = rows.map { row =>
         val (pred, conf) = Try {
           val features: Array[Float] = FEATURE_COLS.map { colName =>
             val idx = row.fieldIndex(colName)
@@ -198,8 +206,10 @@ object ModelLoader {
           inputs.put("float_input", tensor)
 
           val result = session.run(inputs)
-          val label  = result.get("output_label").get().getValue.asInstanceOf[Array[Long]](0)
-          val probas = result.get("output_probability").get().getValue.asInstanceOf[Array[Array[Float]]](0)
+          // skl2onnx < 1.15 nomme les sorties output_label/output_probability,
+          // les versions récentes label/probabilities : on accepte les deux.
+          val label  = firstOutput(result, "output_label", "label").getValue.asInstanceOf[Array[Long]](0)
+          val probas = firstOutput(result, "output_probability", "probabilities").getValue.asInstanceOf[Array[Array[Float]]](0)
           val confidence = if (probas.length >= 2) probas(1).toDouble else probas(0).toDouble
 
           tensor.close()
@@ -210,6 +220,8 @@ object ModelLoader {
 
         Row.fromSeq(row.toSeq ++ Seq(pred, conf))
       }
+      // Ferme la session ONNX une fois la partition entièrement consommée
+      scoredRows ++ { session.close(); Iterator.empty }
     }
     spark.createDataFrame(rdd, outputSchema)
   }
