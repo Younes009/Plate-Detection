@@ -33,13 +33,12 @@ MODELS_PATH    = os.path.join(_BASE, "models")
 
 IMAGE_EXTS = (".jpg", ".jpeg", ".png")
 
-# Colonnes lues depuis OUTPUT/ — image_data (binaire lourd) volontairement exclue
+# Colonnes lues depuis OUTPUT/ — image_data (binaire lourd) volontairement exclue.
+# Le flux continu ne transporte AUCUN label/bbox : le schéma est minimal.
 READ_COLUMNS = [
-    "image_name", "split", "image_path",
-    "label_path", "label_data",
-    "class_id", "cx_norm", "cy_norm", "w_norm", "h_norm",
-    "bbox_area_norm", "aspect_ratio",
-    "prediction", "confidence_score", "processed_at",
+    "image_name", "image_path", "length",
+    "ingested_at", "processed_at",
+    "prediction", "confidence_score",
 ]
 
 PRED_COLORS = {"plate": "#2ecc71", "background": "#95a5a6", "uncertain": "#f39c12"}
@@ -97,18 +96,13 @@ def uri_to_path(uri: str):
 
 
 @st.cache_data(ttl=300, max_entries=64, show_spinner=False)
-def load_image_with_boxes(path: str, boxes: tuple):
-    """Charge une image du disque et dessine les bbox YOLO (normalisées)."""
-    from PIL import Image, ImageDraw
+def load_image(path: str):
+    """Charge une image du disque pour l'aperçu (pas de bbox : le flux
+    d'inférence ne transporte aucun label — la prédiction est au niveau image)."""
+    from PIL import Image
 
-    img = Image.open(path).convert("RGB")
-    w, h = img.size
-    draw = ImageDraw.Draw(img)
-    for cx, cy, bw, bh in boxes:
-        x0, y0 = (cx - bw / 2) * w, (cy - bh / 2) * h
-        x1, y1 = (cx + bw / 2) * w, (cy + bh / 2) * h
-        draw.rectangle([x0, y0, x1, y1], outline="#2ecc71", width=max(2, int(w / 200)))
-    return img
+    with Image.open(path) as img:
+        return img.convert("RGB").copy()
 
 
 def build_traceability(output_df: pd.DataFrame) -> pd.DataFrame:
@@ -236,8 +230,14 @@ with tab_flux:
               help="Images déplacées par le Producer, pas encore traitées par le Consumer.")
     c3.metric("✅ Traités (OUTPUT)", f"{n_done:,}",
               help="Images passées par tout le pipeline, prédiction disponible.")
-    c4.metric("🎯 Confidence moyenne",
-              f"{output_df['confidence_score'].mean():.3f}" if n_done else "—")
+    if n_done:
+        latency = (pd.to_datetime(output_df["processed_at"])
+                   - pd.to_datetime(output_df["ingested_at"])).dt.total_seconds()
+        c4.metric("⏱️ Latence moyenne ingestion→prédiction",
+                  f"{latency.mean():.1f}s",
+                  help="Écart moyen entre le dépôt dans DEST et l'écriture du score.")
+    else:
+        c4.metric("⏱️ Latence moyenne ingestion→prédiction", "—")
 
     # Barre de progression du flux
     total_seen = n_source + n_transit + n_done
@@ -309,23 +309,18 @@ with tab_flux:
             .properties(height=180, title="Débit du stream"),
             width="stretch")
 
-        with st.expander("🖼️ Aperçu des dernières images traitées (bbox ground truth)"):
+        with st.expander("🖼️ Aperçu des dernières images prédites"):
             recent = (output_df.dropna(subset=["image_path"])
                       .sort_values("processed_at", ascending=False)
                       .drop_duplicates("image_name").head(8))
-            boxes_by_image = {
-                name: tuple(zip(g["cx_norm"], g["cy_norm"], g["w_norm"], g["h_norm"]))
-                for name, g in output_df.dropna(subset=["cx_norm"]).groupby("image_name")
-            }
             cols, shown_imgs = st.columns(4), 0
             for _, row in recent.iterrows():
                 local = uri_to_path(row["image_path"])
                 if not local:
                     continue
-                boxes = boxes_by_image.get(row["image_name"], ())
                 with cols[shown_imgs % 4]:
                     try:
-                        st.image(load_image_with_boxes(local, boxes), width="stretch")
+                        st.image(load_image(local), width="stretch")
                     except Exception:
                         continue
                     badge = PRED_COLORS.get(row["prediction"], "#95a5a6")
@@ -382,17 +377,6 @@ with tab_training:
                                         f"Matrice de confusion — {split} "
                                         f"(n={m['n_samples']:,})"),
                         width="stretch")
-
-        if last.get("feature_importances"):
-            fi = (pd.Series(last["feature_importances"])
-                  .rename_axis("feature").reset_index(name="importance"))
-            st.altair_chart(
-                alt.Chart(fi).mark_bar(color="#4c78a8", cornerRadiusEnd=4).encode(
-                    x=alt.X("importance:Q"),
-                    y=alt.Y("feature:N", sort="-x", title=None),
-                    tooltip=["feature", "importance"],
-                ).properties(height=200, title="Importance des features"),
-                width="stretch")
 
         st.subheader("Évolution historique de la précision")
         history = [
