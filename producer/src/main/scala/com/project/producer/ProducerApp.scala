@@ -1,96 +1,107 @@
 package com.project.producer
 
-import com.project.common._
-import org.apache.hadoop.fs.{FileSystem, Path}
-import org.apache.spark.sql.SparkSession
-import org.apache.spark.sql.functions._
+import org.apache.hadoop.fs.{FileSystem, FileUtil, Path}
+import org.apache.spark.{SparkConf, SparkContext}
 
 /**
  * Microservice 1 — Producer BATCH (Spark Core + Scala).
  *
- * Args : [sourcePath] [destPath] [batchSize] [intervalSeconds]
+ * Args : [sourcePath] [destPath] [batchSize] [intervalSeconds] [recursive]
  *
- * Lit les images JPEG/PNG depuis sourcePath de façon récursive,
- * découpe en batches, écrit chaque batch en Parquet Snappy dans destPath/batch_N_TS/.
- * Aucune transformation, aucune jointure — images brutes uniquement.
+ * Transfert BRUT : copie les fichiers images (et leur label YOLO .txt associé)
+ * depuis SOURCE vers DEST via l'API Hadoop FileSystem exclusivement.
+ * AUCUN prétraitement, AUCUNE conversion de format, AUCUNE colonne dérivée —
+ * les fichiers arrivent dans DEST identiques à l'octet près, en conservant
+ * l'arborescence relative (train/images/x.jpg → DEST/train/images/x.jpg).
+ *
+ * Découpage en lots de batchSize images ; pause de intervalSeconds entre deux
+ * lots (aucune consommation de ressources pendant l'attente) ; le service
+ * s'arrête de lui-même une fois tous les lots envoyés.
  */
 object ProducerApp {
 
-  private def listImages(fs: FileSystem, path: Path): Seq[String] =
-    try {
-      fs.listStatus(path).flatMap { s =>
-        if (s.isDirectory) listImages(fs, s.getPath)
-        else if (s.getPath.getName.toLowerCase.matches(".*\\.(jpg|jpeg|png)$"))
-          Seq(s.getPath.toString)
-        else Seq.empty
-      }
-    } catch { case _: Exception => Seq.empty }
+  private val ImagePattern = "(?i).*\\.(jpg|jpeg|png)$"
 
-  private def ensureDir(spark: SparkSession, pathStr: String): FileSystem = {
-    val p  = new Path(pathStr)
-    val fs = p.getFileSystem(spark.sparkContext.hadoopConfiguration)
-    if (!fs.exists(p)) { fs.mkdirs(p); println(s"[Producer] Créé : $pathStr") }
-    fs
+  /** Liste les fichiers sous dir via l'API Hadoop FS, récursivement si demandé. */
+  private def listFiles(fs: FileSystem, dir: Path, recursive: Boolean): Seq[Path] = {
+    val (dirs, files) = fs.listStatus(dir).toSeq.partition(_.isDirectory)
+    val here = files.map(_.getPath)
+    if (recursive) here ++ dirs.flatMap(d => listFiles(fs, d.getPath, recursive))
+    else here
   }
 
   def main(args: Array[String]): Unit = {
     val sourcePath      = if (args.length > 0) args(0) else "license-plate-detection-dataset-10125-images"
     val destPath        = if (args.length > 1) args(1) else "data/dest"
-    val batchSize       = if (args.length > 2) args(2).toInt  else 100
-    val intervalSeconds = if (args.length > 3) args(3).toLong else 0L
+    val batchSize       = if (args.length > 2) args(2).toInt     else 100
+    val intervalSeconds = if (args.length > 3) args(3).toLong    else 0L
+    val recursive       = if (args.length > 4) args(4).toBoolean else true
 
-    val spark = SparkSession.builder()
-      .appName("PlateDetection-Producer-Batch")
-      .getOrCreate()
+    val sc = new SparkContext(
+      new SparkConf()
+        .setAppName("PlateDetection-Producer-Batch")
+        .setIfMissing("spark.master", "local[2]"))
+    val hadoopConf = sc.hadoopConfiguration
 
-    val fs = ensureDir(spark, sourcePath)
-    ensureDir(spark, destPath)
+    val srcRoot = new Path(sourcePath)
+    val srcFs   = srcRoot.getFileSystem(hadoopConf)
+    val srcQ    = srcFs.makeQualified(srcRoot)
+    require(srcFs.exists(srcQ), s"[Producer] Dossier source introuvable : $srcQ")
 
-    val allImages = listImages(fs, new Path(sourcePath))
-    println(s"[Producer] ${allImages.size} images trouvées dans $sourcePath")
+    val destRoot = new Path(destPath)
+    val destFs   = destRoot.getFileSystem(hadoopConf)
+    val destQ    = destFs.makeQualified(destRoot)
+    if (!destFs.exists(destQ)) destFs.mkdirs(destQ)
 
-    if (allImages.isEmpty) {
+    val images = listFiles(srcFs, srcQ, recursive)
+      .filter(_.getName.matches(ImagePattern))
+    println(s"[Producer] ${images.size} images trouvées dans $srcQ (recursive=$recursive)")
+
+    if (images.isEmpty) {
       println("[Producer] Aucune image — arrêt.")
-      spark.stop()
+      sc.stop()
       return
     }
 
-    val batches = allImages.grouped(batchSize).toSeq
+    val srcPrefix = srcQ.toString
+    def relativePath(p: Path): String =
+      p.toString.stripPrefix(srcPrefix).stripPrefix("/")
 
-    batches.zipWithIndex.foreach { case (batchPaths, idx) =>
-      val ts   = System.currentTimeMillis()
-      val dest = s"$destPath/batch_${idx}_$ts"
+    // Label YOLO associé : .../images/foo.jpg → .../labels/foo.txt (s'il existe)
+    def labelFor(img: Path): Option[Path] = {
+      val candidate = new Path(
+        img.toString
+          .replace("/images/", "/labels/")
+          .replaceAll("(?i)\\.(jpg|jpeg|png)$", ".txt"))
+      if (srcFs.exists(candidate)) Some(candidate) else None
+    }
 
-      println(s"[Producer] Batch $idx/${batches.size - 1} — ${batchPaths.size} images")
+    /** Copie brute octet-à-octet via Hadoop FS ; ignore si déjà présent (rejouable). */
+    def copyRaw(src: Path): Boolean = {
+      val dst = new Path(destQ, relativePath(src))
+      if (destFs.exists(dst)) false
+      else {
+        FileUtil.copy(srcFs, src, destFs, dst, /*deleteSource=*/ false, /*overwrite=*/ false, hadoopConf)
+        true
+      }
+    }
 
-      spark.read.format("binaryFile")
-        .load(batchPaths: _*)
-        .withColumn("image_name",
-          regexp_extract(col("path"), "(?i)([^/\\\\]+)\\.(jpg|jpeg|png)$", 1))
-        .withColumn("split",
-          when(col("path").rlike("/(train|valid|test)/"),
-               regexp_extract(col("path"), "/(train|valid|test)/", 1))
-          .otherwise(lit("unknown")))
-        .withColumn("ingested_at", current_timestamp())
-        .select(
-          col("image_name"),
-          col("split"),
-          col("path").as("image_path"),
-          col("content").as("image_data"),
-          col("ingested_at")
-        )
-        .write
-        .mode("overwrite")
-        .option("compression", "snappy")
-        .parquet(dest)
+    val batches = images.grouped(batchSize).toSeq
+    batches.zipWithIndex.foreach { case (batch, idx) =>
+      println(s"[Producer] Batch ${idx + 1}/${batches.size} — ${batch.size} images")
 
-      println(s"[Producer] Batch $idx écrit → $dest")
+      // Label copié AVANT son image : quand le Consumer voit l'image, le label est déjà là.
+      val copied = batch.count { img =>
+        labelFor(img).foreach(copyRaw)
+        copyRaw(img)
+      }
+      println(s"[Producer] Batch ${idx + 1} : $copied nouvelles images → $destQ")
 
       if (idx < batches.size - 1 && intervalSeconds > 0)
         Thread.sleep(intervalSeconds * 1000L)
     }
 
-    println(s"[Producer] Terminé — ${batches.size} batches dans $destPath")
-    spark.stop()
+    println(s"[Producer] Terminé — ${batches.size} batches envoyés dans $destQ")
+    sc.stop()
   }
 }
