@@ -124,16 +124,22 @@ def load_image_with_pred_box(path: str, box):
     return img
 
 
+TRACE_COLUMNS = ["fichier", "statut", "timestamp", "prediction",
+                 "confidence_score", "image_path", "bbox"]
+
+
 def build_traceability(output_df: pd.DataFrame) -> pd.DataFrame:
     """Per-file lineage: Recu (still in SOURCE), En cours (in DEST, not yet
-    in OUTPUT), Traite (in OUTPUT with prediction + score)."""
+    in OUTPUT), Traite (in OUTPUT with prediction + score). image_path and
+    bbox are kept (hidden in the table) to preview the clicked row."""
     rows = []
     processed = set(output_df["image_name"].dropna()) if not output_df.empty else set()
 
     for path in _image_files(SOURCE_INGRESS):
         rows.append({"fichier": os.path.basename(path), "statut": "Reçu",
                      "timestamp": datetime.fromtimestamp(os.path.getmtime(path)),
-                     "prediction": None, "confidence_score": None})
+                     "prediction": None, "confidence_score": None,
+                     "image_path": path, "bbox": None})
 
     for path in _image_files(DEST_INGRESS):
         name = os.path.splitext(os.path.basename(path))[0]
@@ -141,20 +147,24 @@ def build_traceability(output_df: pd.DataFrame) -> pd.DataFrame:
             continue
         rows.append({"fichier": os.path.basename(path), "statut": "En cours",
                      "timestamp": datetime.fromtimestamp(os.path.getmtime(path)),
-                     "prediction": None, "confidence_score": None})
+                     "prediction": None, "confidence_score": None,
+                     "image_path": path, "bbox": None})
 
     if not output_df.empty:
         done = (output_df.sort_values("processed_at")
                 .drop_duplicates("image_name", keep="last"))
         for _, r in done.iterrows():
+            bbox = None
+            if pd.notna(r.get("bbox_cx")):
+                bbox = (r["bbox_cx"], r["bbox_cy"], r["bbox_w"], r["bbox_h"])
             rows.append({"fichier": str(r["image_name"]), "statut": "Traité",
                          "timestamp": pd.to_datetime(r["processed_at"]),
                          "prediction": r["prediction"],
-                         "confidence_score": r["confidence_score"]})
+                         "confidence_score": r["confidence_score"],
+                         "image_path": r["image_path"], "bbox": bbox})
 
     if not rows:
-        return pd.DataFrame(columns=["fichier", "statut", "timestamp",
-                                     "prediction", "confidence_score"])
+        return pd.DataFrame(columns=TRACE_COLUMNS)
     df = pd.DataFrame(rows)
     df["timestamp"] = pd.to_datetime(df["timestamp"])
     return df.sort_values("timestamp", ascending=False)
@@ -265,22 +275,55 @@ with tab_flux:
                 "(ou `python main.py --seed 50`), le Producer les déplacera "
                 "et le Consumer les traitera automatiquement.")
     else:
-        f1, f2 = st.columns([1, 3])
-        with f1:
-            statut_filter = st.multiselect("Statut", STATUS_ORDER, default=STATUS_ORDER)
-        shown = trace[trace["statut"].isin(statut_filter)].head(300)
-        st.dataframe(
-            shown, width="stretch", hide_index=True,
-            column_config={
-                "fichier": st.column_config.TextColumn("Fichier"),
-                "statut": st.column_config.TextColumn("Statut"),
-                "timestamp": st.column_config.DatetimeColumn("Horodatage",
-                                                             format="DD/MM HH:mm:ss"),
-                "prediction": st.column_config.TextColumn("Prédiction"),
-                "confidence_score": st.column_config.ProgressColumn(
-                    "Confidence", format="%.2f", min_value=0.0, max_value=1.0),
-            },
-        )
+        statut_filter = st.multiselect("Statut", STATUS_ORDER, default=STATUS_ORDER)
+        shown = (trace[trace["statut"].isin(statut_filter)]
+                 .head(300).reset_index(drop=True))
+
+        t_table, t_preview = st.columns([5, 3])
+        with t_table:
+            # single-row selection: clicking a row previews the image
+            event = st.dataframe(
+                shown, width="stretch", hide_index=True,
+                on_select="rerun", selection_mode="single-row",
+                key="trace_table",
+                column_config={
+                    "fichier": st.column_config.TextColumn("Fichier"),
+                    "statut": st.column_config.TextColumn("Statut"),
+                    "timestamp": st.column_config.DatetimeColumn("Horodatage",
+                                                                 format="DD/MM HH:mm:ss"),
+                    "prediction": st.column_config.TextColumn("Prédiction"),
+                    "confidence_score": st.column_config.ProgressColumn(
+                        "Confidence", format="%.2f", min_value=0.0, max_value=1.0),
+                    "image_path": None,  # hidden, used by the preview
+                    "bbox": None,
+                },
+            )
+        with t_preview:
+            selected = event.selection.rows if event and event.selection else []
+            if not selected:
+                st.info("Cliquer une ligne du tableau pour afficher l'image "
+                        "(bbox prédite dessinée si l'image est traitée).")
+            else:
+                row = shown.iloc[selected[0]]
+                local = uri_to_path(row["image_path"])
+                if local is None:
+                    st.warning(f"`{row['fichier']}` introuvable sur disque "
+                               "(déplacée ou purgée).")
+                else:
+                    st.image(load_image_with_pred_box(local, row["bbox"]),
+                             width="stretch")
+                    if row["statut"] == "Traité":
+                        badge = PRED_COLORS.get(row["prediction"], "#95a5a6")
+                        st.markdown(
+                            f"<code>{html.escape(str(row['fichier']))}</code> · "
+                            f"<span style='color:{badge};font-weight:600'>"
+                            f"{html.escape(str(row['prediction']))}</span>"
+                            f" · conf {row['confidence_score']:.2f}"
+                            + (" · 🎯 bbox prédite" if row["bbox"] else ""),
+                            unsafe_allow_html=True)
+                    else:
+                        st.caption(f"`{row['fichier']}` — statut {row['statut']}, "
+                                   "pas encore prédite.")
 
     if not output_df.empty:
         st.subheader("Prédictions du flux")
@@ -322,9 +365,17 @@ with tab_flux:
             width="stretch")
 
         st.subheader("🖼️ Détections — bbox prédite autour de la plaque")
+        # slider bounded by the number of processed images (perf cap at 100)
+        max_show = int(max(0, n_done))
+        if max_show > 4:
+            n_show = st.slider("Nombre d'images affichées", 4, max_show,
+                               min(8, max_show),
+                               help=f"{n_done:,} images traitées disponibles.")
+        else:
+            n_show = max_show
         recent = (output_df.dropna(subset=["image_path"])
                   .sort_values("processed_at", ascending=False)
-                  .drop_duplicates("image_name").head(8))
+                  .drop_duplicates("image_name").head(n_show))
         cols, shown_imgs = st.columns(4), 0
         for _, row in recent.iterrows():
             local = uri_to_path(row["image_path"])
