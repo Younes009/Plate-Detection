@@ -163,9 +163,12 @@ python ml/train_yolo.py --dataset-dir data/dest/ml_dataset --model-dir data/mode
 
 - Lit la copie hebdo (images + labels YOLO, splits depuis l'arborescence) —
   les labels ne servent qu'ici, jamais dans le stream.
-- Exporte `plate_locator.onnx` (entrée `[1,3,256,256]`, opset 17 — requis par
-  onnxruntime Java 1.20).
-- Versionne IoU moyen/médian, % IoU ≥ 0.5 (test + val) dans
+- Exporte deux artefacts (entrée `[1,3,256,256]`, opset 17 — requis par
+  onnxruntime Java 1.20) :
+  - `plate_locator_<version>.onnx` — artefact **immuable** du run (traçabilité) ;
+  - `plate_locator.onnx` — **pointeur actif** (copie du dernier), chargé par le
+    Consumer. Rollback = recopier une version archivée sur ce nom.
+- Versionne IoU moyen/médian, % IoU ≥ 0.5 (test + val) + `model_file` dans
   `data/models/metrics/<version>.json`.
 - Le Consumer charge le nouveau modèle à son prochain démarrage.
 

@@ -162,27 +162,37 @@ def evaluate(dataset_dir: str, n_samples: int) -> dict:
     return results
 
 
-def export_onnx(model_dir: str) -> str:
-    """Static 256px export, opset 17 (onnxruntime Java 1.20)."""
+def export_onnx(model_dir: str, version: str) -> str:
+    """
+    Static 256px export, opset 17 (onnxruntime Java 1.20).
+    Model registry with training traceability:
+      - plate_locator_<version>.onnx  immutable versioned artifact
+      - plate_locator.onnx            ACTIVE pointer (copy of the latest —
+        the Consumer loads this name; a real symlink is fragile on Windows)
+    """
     from ultralytics import YOLO
 
     model = YOLO(best_weights())
     exported = model.export(format="onnx", imgsz=IMG_SIZE, opset=17,
                             dynamic=False, device="cpu")
-    target = os.path.join(model_dir, "plate_locator.onnx")
-    shutil.copy2(exported, target)
+    versioned = os.path.join(model_dir, f"plate_locator_{version}.onnx")
+    latest    = os.path.join(model_dir, "plate_locator.onnx")
+    shutil.copy2(exported, versioned)
+    shutil.copy2(exported, latest)
 
     import onnxruntime as rt
-    sess = rt.InferenceSession(target)
-    print(f"[YOLO] plate_locator.onnx exported — inputs "
+    sess = rt.InferenceSession(latest)
+    print(f"[YOLO] exported {os.path.basename(versioned)} + active pointer "
+          f"plate_locator.onnx — inputs "
           f"{[(i.name, i.shape) for i in sess.get_inputs()]} / outputs "
           f"{[(o.name, o.shape) for o in sess.get_outputs()]}")
-    return target
+    return versioned
 
 
 def write_metrics(model_dir: str, version: str, dataset_dir: str,
-                  counts: dict, locator_results: dict) -> str:
-    """Versioned run history consumed by dashboard tab 2."""
+                  counts: dict, locator_results: dict, model_file: str) -> str:
+    """Versioned run history consumed by dashboard tab 2. model_file links
+    each run to its immutable artifact (training traceability)."""
     metrics_dir = os.path.join(model_dir, "metrics")
     os.makedirs(metrics_dir, exist_ok=True)
     payload = {
@@ -192,6 +202,7 @@ def write_metrics(model_dir: str, version: str, dataset_dir: str,
         "dataset_images": int(sum(counts.values())),
         "split_counts": counts,
         "model": "yolov8n",
+        "model_file": os.path.basename(model_file),
         "img_size": IMG_SIZE,
         "locator": locator_results,
     }
@@ -221,8 +232,8 @@ def main():
     if not args.skip_train:
         train(args.dataset_dir, args.epochs, args.imgsz)
     results = evaluate(args.dataset_dir, args.samples)
-    export_onnx(args.model_dir)
-    write_metrics(args.model_dir, version, args.dataset_dir, counts, results)
+    model_file = export_onnx(args.model_dir, version)
+    write_metrics(args.model_dir, version, args.dataset_dir, counts, results, model_file)
     print("[YOLO] done — the Consumer loads plate_locator.onnx on next start.")
 
 
