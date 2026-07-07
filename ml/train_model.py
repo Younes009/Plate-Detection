@@ -75,14 +75,29 @@ def image_to_features(image_path: str) -> np.ndarray:
 
 
 def load_dataset(dataset_dir: str) -> pd.DataFrame:
-    """READ — parcourt la copie hebdo DEST/ml_dataset/ (une ligne par image)."""
+    """
+    READ — parcourt la copie hebdo DEST/ml_dataset/ (une ligne par image).
+
+    Arborescence IMPÉRATIVE (chaque split est étanche : ses labels ne
+    concernent que ses propres images) :
+        ml_dataset/{train,test,val}/images/*.jpg
+        ml_dataset/{train,test,val}/labels/*.txt
+    """
     rows = []
     for entry in sorted(os.listdir(dataset_dir)):
         split = SPLIT_ALIASES.get(entry.lower())
         split_dir = os.path.join(dataset_dir, entry)
         if split is None or not os.path.isdir(split_dir):
             continue
-        for img in glob.glob(os.path.join(split_dir, "**", "*"), recursive=True):
+        images_dir = os.path.join(split_dir, "images")
+        if not os.path.isdir(images_dir):
+            print(f"[Train] ERREUR : sous-répertoire images/ manquant dans {split_dir} "
+                  "(arborescence attendue : <split>/images + <split>/labels).")
+            sys.exit(1)
+        if not os.path.isdir(os.path.join(split_dir, "labels")):
+            print(f"[Train] ATTENTION : pas de labels/ dans {split_dir} — "
+                  "toutes les images de ce split seront des négatifs (background).")
+        for img in glob.glob(os.path.join(images_dir, "**", "*"), recursive=True):
             if img.lower().endswith(IMAGE_EXTS):
                 rows.append({"image_path": img,
                              "image_name": os.path.splitext(os.path.basename(img))[0],

@@ -43,6 +43,19 @@ plate-detection-spark/
 
 > Si `data/source/ml_dataset/` est absent, le dataset livré
 > `license-plate-detection-dataset-10125-images/` joue ce rôle automatiquement.
+>
+> Arborescence impérative de `ml_dataset/` — chaque split est étanche
+> (ses labels ne concernent que ses propres images) :
+>
+> ```
+> ml_dataset/
+> ├── train/ ├── images/*.jpg
+> │          └── labels/*.txt
+> ├── test/  ├── images/*.jpg
+> │          └── labels/*.txt
+> └── val/   ├── images/*.jpg      # "valid" accepté aussi
+>            └── labels/*.txt
+> ```
 
 ---
 

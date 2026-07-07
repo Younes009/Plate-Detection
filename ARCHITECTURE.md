@@ -26,7 +26,7 @@ dans le stream, elle est lue directement par le service ML Python.
 | Zone | Rôle |
 |---|---|
 | `data/source/continuous_ingress/` | Nouvelles images brutes arrivant au fil de l'eau (à prédire) |
-| `data/source/ml_dataset/` | Données historiques d'entraînement — arborescence stricte `train/`, `test/`, `val(id)/` (le dataset livré joue ce rôle si le dossier est absent) |
+| `data/source/ml_dataset/` | Données historiques d'entraînement — arborescence IMPÉRATIVE `{train,test,val(id)}/{images,labels}/` : chaque split contient de manière étanche ses images ET leurs labels YOLO `.txt` (le dataset livré joue ce rôle si le dossier est absent) |
 | `data/dest/continuous_ingress/` | Images déplacées par le Producer, détectées par le Consumer |
 | `data/dest/ml_dataset/` | Copie hebdomadaire intégrale, lue par le service ML |
 | `data/staging/` | Couche intermédiaire propre (Parquet, une ligne/bbox) |
