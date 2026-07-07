@@ -10,9 +10,9 @@ Pipeline Big Data à deux temporalités (voir [ARCHITECTURE.md](ARCHITECTURE.md)
   et écrit `OUTPUT/` ; dashboard Streamlit en lecture continue.
 - **Flux hebdomadaire (réentraînement)** : Producer en mode batch copie
   l'intégralité de `SOURCE/ml_dataset/` (arborescence `train/test/val`, images
-  + labels YOLO) vers `DEST/ml_dataset/` ; le service ML Python entraîne sur
-  les pixels réduits, exporte `.onnx` + `.pkl` dans `MODEL/` et versionne ses
-  métriques.
+  + labels YOLO) vers `DEST/ml_dataset/` ; le service ML Python fine-tune
+  YOLOv8n, exporte `plate_locator.onnx` dans `MODEL/` et versionne ses
+  métriques IoU.
 
 ---
 
@@ -28,9 +28,8 @@ plate-detection-spark/
 ├── consumer/src/main/scala/com/project/consumer/ConsumerApp.scala    # Microservice 2 — Structured Streaming
 ├── ml/
 │   ├── src/main/scala/com/project/ml/ModelLoader.scala               # scoring ONNX broadcasté
-│   ├── train_model.py                                                # réentraînement hebdo + métriques versionnées
-│   ├── export_pytorch.py                                             # export optionnel best_model.pt → best_model.onnx
-│   ├── checkpoints/                                                  # modèle PyTorch pré-entraîné (optionnel)
+│   ├── train_yolo.py                                                 # détecteur YOLOv8n → plate_locator.onnx + métriques
+│   ├── tests/                                                        # pytest (IoU, prétraitement, labels)
 │   └── requirements.txt
 ├── streamlit/
 │   ├── app.py                                                        # dashboard 2 onglets (flux + entraînement)
@@ -158,16 +157,15 @@ aucun DStream, aucune boucle manuelle. Seul service permanent du pipeline.
 ### Service ML — réentraînement hebdomadaire
 
 ```bash
-python ml/train_model.py --dataset-dir data/dest/ml_dataset --model-dir data/models
+# Fine-tune YOLOv8n (IoU test ~0.77) + éval IoU + export ONNX + métriques
+python ml/train_yolo.py --dataset-dir data/dest/ml_dataset --model-dir data/models --epochs 3
 ```
 
 - Lit la copie hebdo (images + labels YOLO, splits depuis l'arborescence) —
   les labels ne servent qu'ici, jamais dans le stream.
-- Features = pixels réduits 32×32 RGB (même prétraitement que le scoring
-  Scala) ; cible = présence d'un label YOLO non vide.
-- Exporte `plate_model.onnx` (entrée `[None, 3072]`, opset 21 — requis par
-  onnxruntime Java 1.20) + `plate_model.pkl` (backup).
-- Versionne accuracy / F1 / matrice de confusion (test + val) dans
+- Exporte `plate_locator.onnx` (entrée `[1,3,256,256]`, opset 17 — requis par
+  onnxruntime Java 1.20).
+- Versionne IoU moyen/médian, % IoU ≥ 0.5 (test + val) dans
   `data/models/metrics/<version>.json`.
 - Le Consumer charge le nouveau modèle à son prochain démarrage.
 
@@ -206,10 +204,10 @@ Voir [ARCHITECTURE.md](ARCHITECTURE.md#schémas-des-données). En résumé :
 ## Modèle ML — priorité de chargement (ModelLoader)
 
 ```
-1. best_model.onnx    → CNN PyTorch [1,3,256,256] (ImageNet normalized)
-2. plate_model.onnx   → sklearn RandomForest sur pixels réduits [None, 3*S*S]
-                        (S déduit de la forme du modèle)   ← produit par train_model.py
-3. (aucun fichier)    → fallback neutre (uncertain, 0.5)
+1. plate_locator.onnx → détecteur YOLOv8n [1,3,S,S] → [1,4+k,N]
+                        (S déduit de la forme du modèle ; prediction,
+                        confidence ET bbox = meilleure détection)
+2. (aucun fichier)    → fallback neutre (uncertain, 0.5)
 ```
 
 Scoring TOUJOURS directement sur les octets de l'image — aucun label requis.

@@ -8,38 +8,31 @@ import org.apache.spark.sql.functions._
 import org.apache.spark.sql.streaming.Trigger
 
 /**
- * Microservice 2 — Consumer & Predictor (Spark Structured Streaming + Scala).
+ * Microservice 2 — Consumer & Predictor (Spark Structured Streaming).
  *
- * Args : [ingressPath] [stagingPath] [outputPath] [modelPath] [checkpointPath]
+ * The only permanent service (awaitTermination, exactly-once checkpoint).
+ * Native streaming: no DStream, no manual loop. Listens EXCLUSIVELY to
+ * DEST/continuous_ingress — raw images without YOLO labels; ml_dataset never
+ * enters the stream.
  *
- * Tourne EN PERMANENCE (awaitTermination, checkpoint exactly-once) — c'est le
- * seul service permanent du pipeline. Structured Streaming natif : aucun
- * DStream, aucune boucle manuelle.
+ * Strict order per micro-batch:
+ *   1. FETCH   readStream binaryFile on DEST/continuous_ingress
+ *   2. PARSE + TRANSFORM   filter valid images, typed columns
+ *   3. WRITE   staging (Parquet history) BEFORE any prediction
+ *   4. PREDICT broadcast ONNX vision model, scoring on raw image bytes
+ *   5. WRITE   prediction + confidence + predicted bbox to OUTPUT
+ *   6. ARCHIVE move processed files out of DEST
  *
- * Il écoute EXCLUSIVEMENT DEST/continuous_ingress/ : des images brutes, sans
- * aucun label YOLO (les labels n'existent que dans ml_dataset, consommé par le
- * service ML Python — jamais par le stream). Aucune recherche de fichier .txt.
- *
- * Ordre STRICT des étapes, dans chaque micro-batch :
- *   1. FETCH      : readStream binaryFile sur DEST/continuous_ingress/
- *   2. PARSE +
- *      TRANSFORM  : nettoyage (filtre images valides) + typage des colonnes
- *   3. WRITE      : écriture immédiate des images propres dans STAGING/
- *                   (Parquet — couche d'historique)
- *   4. PREDICT    : modèle de vision ONNX broadcasté (injecté au démarrage),
- *                   scoring DIRECTEMENT sur les octets de l'image
- *   5. WRITE      : résultat final + confidence_score dans OUTPUT/
+ * Args: [ingressPath] [stagingPath] [outputPath] [modelPath] [checkpointPath] [archivePath]
  */
 object ConsumerApp {
 
-  /**
-   * PARSE & TRANSFORM : nettoie et type le flux brut binaryFile.
-   * Produit exactement Schemas.stagingSchema — une ligne par image propre.
-   */
+  /** PARSE & TRANSFORM: clean and type the raw binaryFile stream.
+   *  Produces exactly Schemas.stagingSchema, one row per valid image. */
   private[consumer] def parseAndTransform(raw: DataFrame): DataFrame =
     raw
-      .where(col("path").rlike("(?i)\\.(jpg|jpeg|png)$")) // images uniquement
-      .where(col("content").isNotNull && col("length") > 0) // écarte les fichiers vides
+      .where(col("path").rlike("(?i)\\.(jpg|jpeg|png)$"))
+      .where(col("content").isNotNull && col("length") > 0)
       .select(
         regexp_extract(col("path"), "(?i)([^/\\\\]+)\\.(jpg|jpeg|png)$", 1).as("image_name"),
         col("path").as("image_path"),
@@ -49,19 +42,14 @@ object ConsumerApp {
         current_timestamp().as("processed_at"))
 
   /**
-   * Écriture IDEMPOTENTE d'un micro-batch, PARTITIONNÉE PAR DATE :
+   * Idempotent micro-batch write, partitioned by date:
    *   <base>/ingest_date=YYYY-MM-DD/batch_id=N/
    *
-   * - Idempotence : le checkpoint garantit que la source ne relit pas un
-   *   fichier, mais pas l'idempotence du sink — sur reprise après échec, un
-   *   même batchId est rejoué et .mode("append") dupliquerait les lignes.
-   *   Le rejeu est détecté par globStatus sur TOUTES les dates (un crash à
-   *   cheval sur minuit ne réécrit pas le batch sous la nouvelle date).
-   *   _SUCCESS présent → skip ; répertoire orphelin → purgé puis réécrit.
-   * - Partition par date : évite l'accumulation à plat de milliers de
-   *   répertoires batch_id (dégradation du listing) et permet la rétention /
-   *   compaction par jour. Spark relit ingest_date et batch_id comme colonnes
-   *   de partition.
+   * The checkpoint stops the source from re-reading files, not the sink from
+   * replaying a batchId after a crash — append mode would duplicate rows.
+   * Replay detection globs batch_id=N across ALL dates (midnight-crossing
+   * crash safe). _SUCCESS present -> skip; orphan dir -> purge and rewrite.
+   * Date partitioning also keeps directory listings bounded.
    */
   private[consumer] def writeIdempotent(df: DataFrame, basePath: String, batchId: Long): Boolean = {
     val base = new Path(basePath.stripSuffix("/").stripSuffix("\\"))
@@ -69,11 +57,11 @@ object ConsumerApp {
 
     val replayed = fs.globStatus(new Path(base, s"ingest_date=*/batch_id=$batchId/_SUCCESS"))
     if (replayed != null && replayed.nonEmpty) {
-      println(s"[Consumer] batch $batchId déjà présent dans $basePath — skip (rejeu).")
+      println(s"[Consumer] batch $batchId already in $basePath — skip (replay).")
       false
     } else {
       val dir = new Path(base, s"ingest_date=${java.time.LocalDate.now}/batch_id=$batchId")
-      if (fs.exists(dir)) fs.delete(dir, true) // batch interrompu : on repart proprement
+      if (fs.exists(dir)) fs.delete(dir, true) // interrupted batch leftovers
       df.write
         .mode("overwrite")
         .option("compression", "snappy")
@@ -82,14 +70,9 @@ object ConsumerApp {
     }
   }
 
-  /**
-   * Archivage de DEST après persistance : une fois le batch écrit dans
-   * staging + output, les fichiers sources sont DÉPLACÉS de
-   * DEST/continuous_ingress vers ARCHIVE (rename, pas de copie). Sans ça,
-   * DEST grossit indéfiniment et le listing de la source streaming ralentit
-   * à chaque trigger. Les octets restent disponibles dans STAGING
-   * (image_data) et dans l'archive (aperçu dashboard).
-   */
+  /** Move processed source files from DEST to ARCHIVE (rename, no copy).
+   *  Called only AFTER staging+output are persisted. Keeps the streaming
+   *  source listing fast; bytes remain in staging and in the archive. */
   private[consumer] def archiveIngested(df: DataFrame, archivePath: String): Unit = {
     val conf    = df.sparkSession.sparkContext.hadoopConfiguration
     val archive = new Path(archivePath.stripSuffix("/").stripSuffix("\\"))
@@ -102,11 +85,11 @@ object ConsumerApp {
       val src = new Path(uri)
       if (fs.exists(src) && fs.rename(src, new Path(archive, src.getName))) moved += 1
     }
-    if (moved > 0) println(s"[Consumer] $moved fichiers archivés → $archive")
+    if (moved > 0) println(s"[Consumer] $moved files archived -> $archive")
   }
 
-  // Version Spark contre laquelle les jars sont compilés (build.sbt) : un
-  // runtime différent produit des NoSuchMethodError sur l'API streaming.
+  // Spark version the jars were built against; a different runtime throws
+  // NoSuchMethodError on the streaming API.
   private val ExpectedSparkPrefix = "4.1"
 
   def main(args: Array[String]): Unit = {
@@ -123,43 +106,42 @@ object ConsumerApp {
 
     if (!spark.version.startsWith(ExpectedSparkPrefix))
       System.err.println(
-        s"[Consumer][WARN] Spark runtime ${spark.version} ≠ build $ExpectedSparkPrefix.x " +
-        "(build.sbt) — risque de NoSuchMethodError. Aligner spark-submit et sparkVersion.")
+        s"[Consumer][WARN] Spark runtime ${spark.version} != build $ExpectedSparkPrefix.x — " +
+        "NoSuchMethodError risk. Align spark-submit with build.sbt.")
 
-    // Injection du modèle : broadcast une seule fois au démarrage
+    // model injected once at startup, broadcast to executors
     ModelLoader.initialize(spark, modelPath.stripSuffix("/").stripSuffix("\\") + "/")
 
-    // 1. FETCH — stream permanent sur les images brutes déposées par le Producer
+    // 1. FETCH — permanent stream on raw images dropped by the Producer
     val rawStream = spark.readStream
       .format("binaryFile")
-      .schema(Schemas.binaryFileSchema) // schéma fixe imposé par la source binaryFile
+      .schema(Schemas.binaryFileSchema)
       .option("recursiveFileLookup", "true")
       .option("maxFilesPerTrigger", 100)
       .load(ingressPath)
 
     val query = rawStream.writeStream
       .foreachBatch { (batchDF: DataFrame, batchId: Long) =>
-        // 2. PARSE & TRANSFORM — persist : évite de recalculer le batch
-        //    pour les deux écritures + le scoring
+        // 2. PARSE & TRANSFORM — persist: reused by two writes + scoring
         val staged = parseAndTransform(batchDF).persist()
         val rows   = staged.count()
 
         if (rows > 0) {
-          // 3. WRITE intermédiaire — couche staging (historique des images propres)
+          // 3. WRITE staging (history of clean images)
           writeIdempotent(staged, stagingPath, batchId)
 
-          // 4. PREDICT — vision ONNX directement sur les octets de l'image
+          // 4. PREDICT — ONNX directly on image bytes
           val scored = ModelLoader.score(staged)
 
-          // 5. WRITE OUTPUT — prédiction + confidence, lus par le dashboard
+          // 5. WRITE output — read by the dashboard
           if (writeIdempotent(scored, outputPath, batchId))
-            println(s"[Consumer] batch $batchId : $rows images → staging + output")
+            println(s"[Consumer] batch $batchId: $rows images -> staging + output")
 
-          // 6. ARCHIVE — DEST purgé seulement APRÈS persistance staging+output
+          // 6. ARCHIVE — only after staging+output are persisted
           archiveIngested(staged, archivePath)
         }
         staged.unpersist()
-        () // retour Unit explicite : lève l'ambiguïté d'overload de foreachBatch (Scala 2.13)
+        () // explicit Unit: resolves foreachBatch overload ambiguity (Scala 2.13)
       }
       .option("checkpointLocation",
         checkpointPath.stripSuffix("/").stripSuffix("\\") + "/consumer")

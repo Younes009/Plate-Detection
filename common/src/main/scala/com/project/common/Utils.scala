@@ -2,10 +2,7 @@ package com.project.common
 
 import org.apache.spark.sql.types._
 
-/**
- * Chemins par défaut pour un déploiement cluster HDFS.
- * En local, les applications reçoivent leurs chemins en arguments (voir main.py).
- */
+/** Default HDFS paths for cluster deployment. Local runs pass paths as args. */
 object HdfsPaths {
   val SOURCE_INGRESS = "hdfs:///project/source/continuous_ingress/"
   val SOURCE_ML      = "hdfs:///project/source/ml_dataset/"
@@ -19,11 +16,7 @@ object HdfsPaths {
 
 object Schemas {
 
-  /**
-   * Schéma FIXE de la source Spark "binaryFile" — imposé par Spark, ne pas modifier.
-   * C'est ce que le Consumer lit en streaming depuis DEST/continuous_ingress/
-   * (images brutes déplacées telles quelles par le Producer via Hadoop FS).
-   */
+  /** Fixed schema of Spark's binaryFile source — do not modify. */
   val binaryFileSchema: StructType = StructType(Seq(
     StructField("path",             StringType,    nullable = false),
     StructField("modificationTime", TimestampType, nullable = false),
@@ -31,14 +24,8 @@ object Schemas {
     StructField("content",          BinaryType,    nullable = true)
   ))
 
-  /**
-   * Schéma de la couche STAGING (WRITE intermédiaire du Consumer) : une ligne
-   * par image propre, historique du flux d'inférence.
-   *
-   * PAS de colonnes label/bbox : le flux continu ne transporte QUE des images
-   * brutes (les labels YOLO n'existent que dans ml_dataset, consommé par le
-   * service ML Python — jamais par le stream).
-   */
+  /** STAGING layer: one row per clean image. The inference stream carries
+   *  raw images only — no label/bbox columns here. */
   val stagingSchema: StructType = StructType(Seq(
     StructField("image_name",   StringType,    nullable = true),
     StructField("image_path",   StringType,    nullable = false),
@@ -48,11 +35,8 @@ object Schemas {
     StructField("processed_at", TimestampType, nullable = false)
   ))
 
-  /**
-   * Schéma OUTPUT : staging + colonnes de scoring ajoutées par ModelLoader.
-   * bbox_* = boîte englobante PRÉDITE autour de la plaque (coordonnées YOLO
-   * normalisées [0,1], null si aucun localisateur chargé ou prédiction background).
-   */
+  /** OUTPUT layer: staging + scoring columns. bbox_* is the PREDICTED box
+   *  (normalized YOLO coords, null when no locator or below threshold). */
   val outputSchema: StructType = stagingSchema
     .add(StructField("prediction",       StringType, nullable = true))
     .add(StructField("confidence_score", DoubleType, nullable = true))

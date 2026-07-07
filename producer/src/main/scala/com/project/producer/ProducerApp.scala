@@ -4,35 +4,27 @@ import org.apache.hadoop.fs.{FileSystem, FileUtil, Path}
 import org.apache.spark.{SparkConf, SparkContext}
 
 /**
- * Microservice 1 — Producer (Spark Core + API Hadoop FileSystem EXCLUSIVEMENT).
+ * Microservice 1 — Producer (Spark Core + Hadoop FileSystem API only).
  *
- * JOB ÉPHÉMÈRE dans les deux modes : on le lance, il transfère, il S'ARRÊTE
- * TOUT SEUL. Aucune boucle de veille, aucun processus permanent — c'est un
- * déclencheur externe (orchestrateur, cron, trigger) qui le relance.
+ * Short-lived job in both modes: transfer, then exit(0). An external trigger
+ * (main.py scheduler, cron) relaunches it — it never loops.
  *
- *   - mode "continuous" (flux d'inférence, relancé régulièrement) :
- *       scanne SOURCE/continuous_ingress/ (images brutes UNIQUEMENT — aucun
- *       label YOLO ici) et DÉPLACE tout ce qui s'y trouve vers
- *       DEST/continuous_ingress/, par lots de batchSize espacés de
- *       intervalSeconds. Le déplacement vide la source : chaque image n'est
- *       ingérée qu'une fois. Puis exit.
+ *  - "continuous": scan SOURCE/continuous_ingress (raw images only, no YOLO
+ *    labels there) and MOVE everything to DEST/continuous_ingress in lots of
+ *    batchSize. Moving empties the source: each image is ingested once.
+ *  - "batch" (weekly): full recursive COPY of SOURCE/ml_dataset to
+ *    DEST/ml_dataset, train/test/val tree preserved (images AND labels).
+ *    Idempotent: already-copied files are skipped.
  *
- *   - mode "batch" (flux hebdomadaire, lancé une fois par semaine) :
- *       copie BRUTE, RÉCURSIVE et INTÉGRALE de SOURCE/ml_dataset/ vers
- *       DEST/ml_dataset/ en préservant l'arborescence train/test/val (images
- *       ET labels YOLO). Idempotent : les fichiers déjà copiés sont ignorés.
- *       Puis exit.
+ * Raw byte-for-byte transfer — no preprocessing, no conversion.
  *
- * AUCUN prétraitement, AUCUNE conversion : transfert octet-à-octet.
- *
- * Args : [sourcePath] [destPath] [batchSize] [intervalSeconds] [recursive] [mode]
- *   mode ∈ {batch, continuous} — défaut : batch
+ * Args: [sourcePath] [destPath] [batchSize] [intervalSeconds] [recursive] [mode]
  */
 object ProducerApp {
 
   private val ImagePattern = "(?i).*\\.(jpg|jpeg|png)$"
 
-  /** Liste les fichiers sous dir via l'API Hadoop FS, récursivement si demandé. */
+  /** List files under dir via Hadoop FS, recursively if asked. */
   private def listFiles(fs: FileSystem, dir: Path, recursive: Boolean): Seq[Path] = {
     if (!fs.exists(dir)) return Seq.empty
     val (dirs, files) = fs.listStatus(dir).toSeq.partition(_.isDirectory)
@@ -49,7 +41,7 @@ object ProducerApp {
     val recursive       = if (args.length > 4) args(4).toBoolean else true
     val mode            = if (args.length > 5) args(5)           else "batch"
     require(Set("batch", "continuous").contains(mode),
-      s"[Producer] mode inconnu : $mode (attendu : batch | continuous)")
+      s"[Producer] unknown mode: $mode (expected: batch | continuous)")
 
     val sc = new SparkContext(
       new SparkConf()
@@ -60,7 +52,7 @@ object ProducerApp {
     val srcRoot = new Path(sourcePath)
     val srcFs   = srcRoot.getFileSystem(hadoopConf)
     val srcQ    = srcFs.makeQualified(srcRoot)
-    require(srcFs.exists(srcQ), s"[Producer] Dossier source introuvable : $srcQ")
+    require(srcFs.exists(srcQ), s"[Producer] source not found: $srcQ")
 
     val destRoot = new Path(destPath)
     val destFs   = destRoot.getFileSystem(hadoopConf)
@@ -71,11 +63,7 @@ object ProducerApp {
     def relativePath(p: Path): String =
       p.toString.stripPrefix(srcPrefix).stripPrefix("/")
 
-    /**
-     * Transfert brut octet-à-octet via Hadoop FS, arborescence relative préservée.
-     * move=true : déplace (supprime la source) — flux continu.
-     * move=false : copie, ignore si déjà présent — flux hebdo rejouable.
-     */
+    // move=true deletes the source (continuous); move=false skips existing (weekly, replayable)
     def transferRaw(src: Path, move: Boolean): Boolean = {
       val dst = new Path(destQ, relativePath(src))
       if (!move && destFs.exists(dst)) false
@@ -85,35 +73,31 @@ object ProducerApp {
       }
     }
 
-    // Sélection des fichiers selon le mode :
-    //   continuous → images brutes seulement (l'ingress ne contient pas de labels)
-    //   batch      → TOUT (images + labels YOLO, arborescence intégrale)
+    // continuous: images only (no labels in the ingress); batch: everything
     val move  = mode == "continuous"
     val files = {
       val all = listFiles(srcFs, srcQ, recursive)
       if (move) all.filter(_.getName.matches(ImagePattern)) else all
     }
-    println(s"[Producer:$mode] ${files.size} fichiers à transférer depuis $srcQ")
+    println(s"[Producer:$mode] ${files.size} files to transfer from $srcQ")
 
     if (files.isEmpty) {
-      println(s"[Producer:$mode] Rien à transférer — arrêt.")
+      println(s"[Producer:$mode] nothing to transfer — exit.")
       sc.stop()
       return
     }
 
-    // Transfert par lots puis ARRÊT — le job est éphémère dans les deux modes.
+    // transfer in lots, then STOP — the job is ephemeral in both modes
     val batches = files.grouped(batchSize).toSeq
     batches.zipWithIndex.foreach { case (batch, idx) =>
       val n = batch.count(transferRaw(_, move))
-      println(s"[Producer:$mode] Lot ${idx + 1}/${batches.size} : $n fichiers → $destQ")
+      println(s"[Producer:$mode] lot ${idx + 1}/${batches.size}: $n files -> $destQ")
       if (idx < batches.size - 1 && intervalSeconds > 0)
         Thread.sleep(intervalSeconds * 1000L)
     }
 
-    println(s"[Producer:$mode] Terminé (${files.size} fichiers) — arrêt du job.")
+    println(s"[Producer:$mode] done (${files.size} files) — exit.")
     sc.stop()
-    // Job éphémère : extinction propre et explicite (code retour 0),
-    // aucun thread ne doit survivre au transfert.
-    sys.exit(0)
+    sys.exit(0) // ephemeral job: no thread survives the transfer
   }
 }

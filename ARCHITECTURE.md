@@ -8,10 +8,10 @@ SOURCE/continuous_ingress ──déplacement──▶ DEST/continuous_ingress �
                             Producer                                Consumer   (Parquet)    ONNX          (Parquet)   Streamlit
                             mode continuous                         Structured                ▲                       (READ 8)
                             (Hadoop FS, batch/interval)             Streaming                 │
-                                                                                              │ EXPORT 6 (.pkl + .onnx)
+                                                                                              │ EXPORT (plate_locator.onnx)
 FLUX HEBDOMADAIRE (réentraînement, planifié)                                                  │
 SOURCE/ml_dataset ──copie récursive──▶ DEST/ml_dataset ──READ 5──▶ ML Python ────────────────┘
-(train/test/val)    Producer            (arborescence     train_model.py
+(train/test/val)    Producer            (arborescence     train_yolo.py
                     mode batch           préservée)       + métriques versionnées (MODEL/metrics/)
 ```
 
@@ -29,9 +29,10 @@ dans le stream, elle est lue directement par le service ML Python.
 | `data/source/ml_dataset/` | Données historiques d'entraînement — arborescence IMPÉRATIVE `{train,test,val(id)}/{images,labels}/` : chaque split contient de manière étanche ses images ET leurs labels YOLO `.txt` (le dataset livré joue ce rôle si le dossier est absent) |
 | `data/dest/continuous_ingress/` | Images déplacées par le Producer, détectées par le Consumer |
 | `data/dest/ml_dataset/` | Copie hebdomadaire intégrale, lue par le service ML |
-| `data/staging/` | Couche intermédiaire propre (Parquet, une ligne/bbox) |
-| `data/output/` | Résultats enrichis prediction + confidence (Parquet) |
-| `data/models/` | `plate_model.pkl` (contrat) + `plate_model.onnx` (runtime Scala) + `metrics/*.json` (historique versionné) |
+| `data/staging/` | Couche intermédiaire propre (Parquet, une ligne/image) |
+| `data/output/` | Résultats enrichis prediction + confidence + bbox (Parquet) |
+| `data/archive/continuous_ingress/` | Fichiers DEST déplacés après traitement |
+| `data/models/` | `plate_locator.onnx` (YOLOv8n, runtime Scala) + `metrics/*.json` (historique versionné) |
 
 ---
 
@@ -72,22 +73,20 @@ dans chaque micro-batch (`foreachBatch`) :
    les octets de l'image**, ajoute `prediction` + `confidence_score`.
 5. **WRITE OUTPUT** : résultats enrichis dans `data/output/`.
 
-### 3. ML Training — `ml/train_model.py` (Python, indépendant de Spark)
+### 3. ML Training — `ml/train_yolo.py` (Python, indépendant de Spark)
 
 Flux **hebdomadaire** (planifiable via `schtasks` / `cron` sur
 `python main.py --weekly`) :
 
 - **READ** : lit la copie `DEST/ml_dataset/` (images + labels YOLO,
-  splits `train/test/val(id)` depuis l'arborescence). Les labels ne servent
-  QUE là — jamais dans le stream.
-- Features = pixels réduits (S×S RGB, aplati CHW, /255 — S=32 par défaut),
-  EXACTEMENT le prétraitement de `ModelLoader.scala` au scoring ; cible =
-  présence d'un label YOLO non vide.
-- **EXPORT** : `plate_model.onnx` (entrée `[None, 3*S*S]` — le Consumer déduit
-  S de la forme du modèle, opset 21) + `plate_model.pkl` (backup) dans
-  `data/models/`.
-- **Historique** : accuracy / F1 / matrice de confusion (test + val), volume
-  du dataset et version du run dans `data/models/metrics/<version>.json`.
+  splits `train/test/val(id)` depuis l'arborescence, format YOLO natif —
+  YAML ultralytics généré). Les labels ne servent QUE là, jamais dans le stream.
+- Fine-tuning **YOLOv8n** (préentraîné COCO, mono-classe `license-plate`),
+  puis évaluation IoU de la meilleure boîte prédite vs ground truth.
+- **EXPORT** : `plate_locator.onnx` (entrée `[1,3,256,256]` /255 CHW,
+  sortie `[1,4+k,N]`, opset 17) dans `data/models/`.
+- **Historique** : IoU moyen/médian, % IoU ≥ 0.5 (test + val), volume du
+  dataset et version du run dans `data/models/metrics/<version>.json`.
 
 ### 4. Dashboard — `streamlit/app.py` (Streamlit, Python)
 
@@ -101,25 +100,23 @@ octets images depuis les Parquet. **Deux onglets** :
   prédiction + confidence), distribution des prédictions, débit du stream,
   aperçu des dernières images (bbox dessinées).
 - **Suivi de l'entraînement** : modèle actif (version, date du run hebdo,
-  volume dataset, artefacts), accuracy / F1 / matrices de confusion test &
-  val du dernier run, importance des features, évolution historique de la
-  précision au fil des semaines.
+  volume dataset, artefacts), IoU moyen/médian et % IoU ≥ 0.5 test & val du
+  dernier run, évolution historique de l'IoU au fil des semaines.
 
 ---
 
 ## Chargement du modèle — `ml/ModelLoader.scala`
 
-Priorité (première correspondance gagne) — scoring TOUJOURS sur les octets image :
+Scoring TOUJOURS sur les octets image :
 
-1. `best_model.onnx` — CNN PyTorch (entrée `[1,3,256,256]`, ImageNet normalized)
-2. `plate_model.onnx` — RandomForest sklearn sur pixels réduits (entrée
-   `[None, 3*S*S]` — S déduit de la forme du modèle, /255, CHW)
-3. Fallback neutre (`prediction=uncertain`, `confidence=0.5`)
+1. `plate_locator.onnx` — détecteur YOLOv8n (entrée `[1,3,S,S]` — S déduit de
+   la forme du modèle ; sortie `[1,4+k,N]`). La meilleure détection fournit
+   `prediction` (plate si score ≥ 0.5), `confidence_score` ET la bbox
+   normalisée.
+2. Fallback neutre (`prediction=uncertain`, `confidence=0.5`) si aucun modèle.
 
 Le fichier ONNX est broadcasté aux executors ; une session ONNX Runtime est
-ouverte par partition puis fermée après consommation. Les sorties
-`label`/`probabilities` (skl2onnx récent) et `output_label`/`output_probability`
-(anciennes versions) sont toutes deux acceptées.
+ouverte par partition et fermée par `TaskCompletionListener` (succès ou échec).
 
 ---
 
@@ -198,7 +195,7 @@ spark-submit --master local[2] consumer/target/scala-2.13/consumer-assembly-0.1.
   data/dest/continuous_ingress data/staging data/output data/models data/checkpoint
 
 # Entraînement seul (après un passage du Producer batch)
-python ml/train_model.py --dataset-dir data/dest/ml_dataset --model-dir data/models
+python ml/train_yolo.py --dataset-dir data/dest/ml_dataset --model-dir data/models
 ```
 
 Planification hebdomadaire :

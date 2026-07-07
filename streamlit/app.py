@@ -1,16 +1,14 @@
 """
-Dashboard Streamlit — LECTURE SEULE, en continu (READ 8).
+Streamlit dashboard — READ-ONLY continuous view of the pipeline.
 
-Deux onglets, conformes au cahier des charges :
-  1. Suivi des prédictions & du flux : Pipeline Tracker de bout en bout
-     (SOURCE → DEST → OUTPUT), table de traçabilité par fichier avec statut
-     (Reçu / En cours / Traité), prédictions et score de confiance.
-  2. Suivi de l'entraînement : modèle actif (version, date, volume dataset),
-     métriques du dernier run hebdo (accuracy, F1, matrice de confusion
-     test/val) et évolution historique de la précision.
+Two tabs:
+  1. Flow & predictions: end-to-end Pipeline Tracker (SOURCE -> DEST ->
+     OUTPUT), per-file traceability (Recu / En cours / Traite), predicted
+     bbox drawn on recent images.
+  2. Training: active model version, accuracy / F1 / confusion matrices,
+     locator IoU, accuracy history across weekly runs.
 
-Les octets images (image_data) ne sont jamais chargés depuis les Parquet ;
-l'aperçu ouvre les fichiers images directement sur disque via image_path.
+image_data bytes are never loaded from Parquet; previews open files on disk.
 """
 
 import glob
@@ -35,8 +33,7 @@ MODELS_PATH     = os.path.join(_BASE, "models")
 
 IMAGE_EXTS = (".jpg", ".jpeg", ".png")
 
-# Colonnes lues depuis OUTPUT/ — image_data (binaire lourd) volontairement exclue.
-# bbox_* = boîte PRÉDITE par le localisateur (coordonnées YOLO normalisées).
+# image_data (heavy binary) intentionally excluded
 READ_COLUMNS = [
     "image_name", "image_path", "length",
     "ingested_at", "processed_at",
@@ -48,7 +45,7 @@ PRED_COLORS = {"plate": "#2ecc71", "background": "#95a5a6", "uncertain": "#f39c1
 STATUS_ORDER = ["Reçu", "En cours", "Traité"]
 
 
-# ─── Chargement des données ──────────────────────────────────────────────────
+# ─── Data loading ────────────────────────────────────────────────────────────
 
 def _image_files(directory: str):
     if not os.path.isdir(directory):
@@ -67,16 +64,16 @@ def load_output() -> pd.DataFrame:
         try:
             frames.append(pd.read_parquet(f, columns=READ_COLUMNS))
         except Exception:
-            # Fichier d'un ancien schéma : on lit tout puis on filtre
+            # older schema: read everything then filter
             df = pd.read_parquet(f)
             frames.append(df[[c for c in READ_COLUMNS if c in df.columns]])
-    # reindex : garantit toutes les colonnes attendues (NaN si schéma ancien)
+    # reindex guarantees all expected columns (NaN for old schemas)
     return pd.concat(frames, ignore_index=True).reindex(columns=READ_COLUMNS)
 
 
 @st.cache_data(ttl=30, show_spinner=False)
 def load_metrics_history() -> list:
-    """Runs hebdo triés du plus ancien au plus récent (MODEL/metrics/*.json)."""
+    """Weekly runs, oldest first (MODEL/metrics/*.json)."""
     runs = []
     for path in glob.glob(os.path.join(METRICS_PATH, "*.json")):
         try:
@@ -88,11 +85,8 @@ def load_metrics_history() -> list:
 
 
 def uri_to_path(uri: str):
-    """
-    Convertit une URI Spark (file:/C:/...) en chemin local. Le Consumer
-    archive DEST après traitement : si le fichier n'est plus dans
-    DEST/continuous_ingress, on le cherche dans ARCHIVE/continuous_ingress.
-    """
+    """Spark URI (file:/C:/...) -> local path. Falls back to the archive:
+    the Consumer moves DEST files there after processing."""
     if not uri:
         return None
     path = uri
@@ -106,10 +100,7 @@ def uri_to_path(uri: str):
 
 @st.cache_data(ttl=300, max_entries=64, show_spinner=False)
 def load_image_with_pred_box(path: str, box):
-    """
-    Charge une image du disque et TRACE la bbox PRÉDITE par le localisateur
-    (cx, cy, w, h normalisés — sortie du modèle, pas un label ground truth).
-    """
+    """Draw the PREDICTED bbox (model output, normalized YOLO coords)."""
     from PIL import Image, ImageDraw
 
     with Image.open(path) as raw:
@@ -125,12 +116,8 @@ def load_image_with_pred_box(path: str, box):
 
 
 def build_traceability(output_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Lineage par fichier :
-      Reçu     = image encore dans SOURCE/continuous_ingress (en attente Producer)
-      En cours = image dans DEST/continuous_ingress, pas encore dans OUTPUT
-      Traité   = image présente dans OUTPUT avec prédiction + score
-    """
+    """Per-file lineage: Recu (still in SOURCE), En cours (in DEST, not yet
+    in OUTPUT), Traite (in OUTPUT with prediction + score)."""
     rows = []
     processed = set(output_df["image_name"].dropna()) if not output_df.empty else set()
 
@@ -142,7 +129,7 @@ def build_traceability(output_df: pd.DataFrame) -> pd.DataFrame:
     for path in _image_files(DEST_INGRESS):
         name = os.path.splitext(os.path.basename(path))[0]
         if name in processed:
-            continue  # apparaîtra en "Traité" via OUTPUT
+            continue
         rows.append({"fichier": os.path.basename(path), "statut": "En cours",
                      "timestamp": datetime.fromtimestamp(os.path.getmtime(path)),
                      "prediction": None, "confidence_score": None})
@@ -206,10 +193,9 @@ with st.sidebar:
     st.caption(f"📂 DEST : `{DEST_INGRESS}`")
     st.caption(f"📂 OUTPUT : `{OUTPUT_PATH}`")
 
-# Rafraîchissement non bloquant : le fragment se réveille tout seul et
-# déclenche un rerun global — l'UI reste interactive entre deux ticks.
-# Le flag évite que le rendu initial du fragment (dans ce même run) ne
-# relance immédiatement le script en boucle.
+# Non-blocking refresh: the fragment wakes up alone and triggers a full
+# rerun. The flag stops the fragment's initial render (same run) from
+# relaunching the script in a loop.
 if auto_refresh:
     st.session_state["_tick_armed"] = False
 
@@ -232,7 +218,7 @@ except Exception as exc:
 tab_flux, tab_training = st.tabs(
     ["📡 Suivi des prédictions & du flux", "🧠 Suivi de l'entraînement"])
 
-# ═══ Onglet 1 — Pipeline Tracker + traçabilité ═══════════════════════════════
+# ═══ Tab 1 — Pipeline Tracker + traceability ═════════════════════════════════
 
 with tab_flux:
     st.subheader("Pipeline Tracker — lineage de bout en bout")
@@ -252,13 +238,11 @@ with tab_flux:
     if n_done:
         latency = (pd.to_datetime(output_df["processed_at"])
                    - pd.to_datetime(output_df["ingested_at"])).dt.total_seconds()
-        c4.metric("⏱️ Latence moyenne ingestion→prédiction",
-                  f"{latency.mean():.1f}s",
+        c4.metric("⏱️ Latence moyenne ingestion→prédiction", f"{latency.mean():.1f}s",
                   help="Écart moyen entre le dépôt dans DEST et l'écriture du score.")
     else:
         c4.metric("⏱️ Latence moyenne ingestion→prédiction", "—")
 
-    # Barre de progression du flux
     total_seen = n_source + n_transit + n_done
     if total_seen:
         st.progress(n_done / total_seen,
@@ -347,8 +331,7 @@ with tab_flux:
                     continue
                 badge = PRED_COLORS.get(row["prediction"], "#95a5a6")
                 bbox_note = "· 🎯 bbox prédite" if box else "· pas de bbox"
-                # html.escape : les noms de fichiers sont des données externes,
-                # injectées ici dans du HTML (unsafe_allow_html)
+                # file names are external data injected into HTML
                 st.markdown(
                     f"<code>{html.escape(str(row['image_name']))}</code><br>"
                     f"<span style='color:{badge};font-weight:600'>"
@@ -357,16 +340,15 @@ with tab_flux:
                     unsafe_allow_html=True)
             shown_imgs += 1
 
-# ═══ Onglet 2 — Suivi de l'entraînement ══════════════════════════════════════
+# ═══ Tab 2 — Training monitoring ═════════════════════════════════════════════
 
 with tab_training:
     runs = load_metrics_history()
 
     if not runs:
         st.info("**Aucun run d'entraînement enregistré.**\n\n"
-                "Lancer le flux hebdomadaire : `python main.py --weekly` — "
-                "le Producer copiera `SOURCE/ml_dataset/` vers `DEST/ml_dataset/`, "
-                "puis le service ML entraînera le modèle et déposera ses métriques ici.")
+                "Lancer le flux hebdomadaire : `python main.py --weekly` puis "
+                "`python ml/train_yolo.py` — les métriques apparaîtront ici.")
     else:
         last = runs[-1]
         trained_at = pd.to_datetime(last.get("trained_at"))
@@ -378,18 +360,16 @@ with tab_training:
         m3.metric("Volume dataset (images)", f"{last.get('dataset_images', 0):,}")
         m4.metric("Runs enregistrés", len(runs))
 
-        pkl_ok = os.path.exists(os.path.join(MODELS_PATH, "plate_model.pkl"))
-        onnx_ok = os.path.exists(os.path.join(MODELS_PATH, "plate_model.onnx"))
+        loc_ok = os.path.exists(os.path.join(MODELS_PATH, "plate_locator.onnx"))
         st.caption(
-            f"Artefacts : plate_model.pkl {'✅' if pkl_ok else '❌'} · "
-            f"plate_model.onnx {'✅' if onnx_ok else '❌'} · "
+            f"Artefacts : plate_locator.onnx {'✅' if loc_ok else '❌'} · "
+            f"modèle : {last.get('model', '?')} · "
             f"répartition : {last.get('split_counts', {})}")
 
-        st.subheader("Performance du dernier entraînement")
+        # classifier metrics only exist for legacy runs; YOLO runs skip this
         metrics = last.get("metrics", {})
-        if not metrics:
-            st.warning("Run enregistré sans métriques (sets test/val vides ?).")
-        else:
+        if metrics:
+            st.subheader("Performance du classifieur")
             kpi_cols = st.columns(2 * max(1, len(metrics)))
             for i, (split, m) in enumerate(metrics.items()):
                 kpi_cols[2 * i].metric(f"Accuracy ({split})", f"{m['accuracy']:.3f}")
@@ -409,15 +389,23 @@ with tab_training:
             st.subheader("Localisation — qualité des bbox prédites (IoU vs ground truth)")
             loc_cols = st.columns(3 * len(locator))
             for i, (split, m) in enumerate(locator.items()):
-                loc_cols[3 * i].metric(f"IoU moyen ({split})", f"{m['iou_mean']:.3f}")
-                loc_cols[3 * i + 1].metric(f"IoU ≥ 0.5 ({split})", f"{m['pct_iou_over_50']:.0%}")
-                loc_cols[3 * i + 2].metric(f"MAE coords ({split})", f"{m['mae']:.4f}")
+                loc_cols[3 * i].metric(f"IoU moyen ({split})", f"{m.get('iou_mean', 0):.3f}")
+                loc_cols[3 * i + 1].metric(f"IoU ≥ 0.5 ({split})",
+                                           f"{m.get('pct_iou_over_50', 0):.0%}")
+                # third metric depends on the locator: MAE (CNN) or median (YOLO)
+                if "mae" in m:
+                    loc_cols[3 * i + 2].metric(f"MAE coords ({split})", f"{m['mae']:.4f}")
+                else:
+                    loc_cols[3 * i + 2].metric(f"IoU médian ({split})",
+                                               f"{m.get('iou_median', 0):.3f}")
+            if any("model" in m for m in locator.values()):
+                st.caption(f"Localisateur : {next(iter(locator.values())).get('model', '?')}")
 
-        st.subheader("Évolution historique de la précision")
+        st.subheader("Évolution historique — IoU du détecteur")
         history = [
             {"version": r["version"], "trained_at": r["trained_at"],
-             "split": split, "accuracy": m["accuracy"], "f1": m["f1_score"]}
-            for r in runs for split, m in r.get("metrics", {}).items()
+             "split": split, "iou": m.get("iou_mean", 0)}
+            for r in runs for split, m in r.get("locator", {}).items()
         ]
         if len(history) < 2:
             st.caption("L'historique se remplira au fil des runs hebdomadaires.")
@@ -429,9 +417,9 @@ with tab_training:
                 .mark_line(point=True)
                 .encode(
                     x=alt.X("trained_at:T", title="Date du run"),
-                    y=alt.Y("accuracy:Q", title="Accuracy",
+                    y=alt.Y("iou:Q", title="IoU moyen",
                             scale=alt.Scale(domain=[0, 1])),
                     color=alt.Color("split:N", title="Set"),
-                    tooltip=["version", "split", "accuracy", "f1"],
+                    tooltip=["version", "split", "iou"],
                 ).properties(height=260),
                 width="stretch")

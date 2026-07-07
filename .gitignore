@@ -74,3 +74,6 @@ Thumbs.db
 saved_model/
 results/
 data/
+
+ml/yolo_runs/
+*.log
