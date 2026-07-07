@@ -14,6 +14,7 @@ l'aperçu ouvre les fichiers images directement sur disque via image_path.
 """
 
 import glob
+import html
 import json
 import os
 import urllib.parse
@@ -25,11 +26,12 @@ import pandas as pd
 import streamlit as st
 
 _BASE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
-SOURCE_INGRESS = os.path.join(_BASE, "source", "continuous_ingress")
-DEST_INGRESS   = os.path.join(_BASE, "dest", "continuous_ingress")
-OUTPUT_PATH    = os.path.join(_BASE, "output")
-METRICS_PATH   = os.path.join(_BASE, "models", "metrics")
-MODELS_PATH    = os.path.join(_BASE, "models")
+SOURCE_INGRESS  = os.path.join(_BASE, "source", "continuous_ingress")
+DEST_INGRESS    = os.path.join(_BASE, "dest", "continuous_ingress")
+ARCHIVE_INGRESS = os.path.join(_BASE, "archive", "continuous_ingress")
+OUTPUT_PATH     = os.path.join(_BASE, "output")
+METRICS_PATH    = os.path.join(_BASE, "models", "metrics")
+MODELS_PATH     = os.path.join(_BASE, "models")
 
 IMAGE_EXTS = (".jpg", ".jpeg", ".png")
 
@@ -86,14 +88,20 @@ def load_metrics_history() -> list:
 
 
 def uri_to_path(uri: str):
-    """Convertit une URI Spark (file:/C:/...) en chemin local, None si distant."""
+    """
+    Convertit une URI Spark (file:/C:/...) en chemin local. Le Consumer
+    archive DEST après traitement : si le fichier n'est plus dans
+    DEST/continuous_ingress, on le cherche dans ARCHIVE/continuous_ingress.
+    """
     if not uri:
         return None
+    path = uri
     if uri.startswith("file:"):
-        parsed = urllib.parse.urlparse(uri)
-        path = urllib.request.url2pathname(parsed.path)
-        return path if os.path.exists(path) else None
-    return uri if os.path.exists(uri) else None
+        path = urllib.request.url2pathname(urllib.parse.urlparse(uri).path)
+    if os.path.exists(path):
+        return path
+    archived = os.path.join(ARCHIVE_INGRESS, os.path.basename(path))
+    return archived if os.path.exists(archived) else None
 
 
 @st.cache_data(ttl=300, max_entries=64, show_spinner=False)
@@ -339,9 +347,12 @@ with tab_flux:
                     continue
                 badge = PRED_COLORS.get(row["prediction"], "#95a5a6")
                 bbox_note = "· 🎯 bbox prédite" if box else "· pas de bbox"
+                # html.escape : les noms de fichiers sont des données externes,
+                # injectées ici dans du HTML (unsafe_allow_html)
                 st.markdown(
-                    f"<code>{row['image_name']}</code><br>"
-                    f"<span style='color:{badge};font-weight:600'>{row['prediction']}</span>"
+                    f"<code>{html.escape(str(row['image_name']))}</code><br>"
+                    f"<span style='color:{badge};font-weight:600'>"
+                    f"{html.escape(str(row['prediction']))}</span>"
                     f" · conf {row['confidence_score']:.2f} {bbox_note}",
                     unsafe_allow_html=True)
             shown_imgs += 1

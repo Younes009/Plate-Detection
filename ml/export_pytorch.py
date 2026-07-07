@@ -41,7 +41,18 @@ def load_model(checkpoint_path: str, num_classes: int) -> nn.Module:
       2. Dict avec clé 'model'
       3. Dict avec clé 'model_state_dict' → enveloppe dans un wrapper générique
     """
-    raw = torch.load(checkpoint_path, map_location="cpu")
+    # weights_only=True : un checkpoint pickle peut exécuter du code arbitraire
+    # au chargement. Le déballage complet (nn.Module picklé) n'est accepté que
+    # si ALLOW_UNSAFE_CHECKPOINT=1 est posé explicitement (source de confiance).
+    try:
+        raw = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    except Exception:
+        if os.environ.get("ALLOW_UNSAFE_CHECKPOINT") != "1":
+            raise SystemExit(
+                f"[Export] {checkpoint_path} n'est pas un state_dict pur "
+                "(weights_only=True a échoué). Si la source est de confiance, "
+                "relancer avec ALLOW_UNSAFE_CHECKPOINT=1.")
+        raw = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
 
     if isinstance(raw, nn.Module):
         print(f"[Export] Chargé comme nn.Module : {type(raw).__name__}")

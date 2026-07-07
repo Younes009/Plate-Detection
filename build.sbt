@@ -1,4 +1,6 @@
-ThisBuild / scalaVersion := "2.13.14"
+// 2.13.17 : Spark 4.1.1 est compilé avec et appelle MurmurHash3.caseClassHash
+// (absent avant 2.13.17) — une scala-library plus ancienne casse au runtime.
+ThisBuild / scalaVersion := "2.13.17"
 ThisBuild / version      := "0.1.0"
 
 // Doit matcher la version du spark-submit installé (spark-submit --version)
@@ -13,7 +15,8 @@ lazy val commonSettings = Seq(
     "org.apache.spark" %% "spark-core"  % sparkVersion % "provided",
     "org.apache.spark" %% "spark-sql"   % sparkVersion % "provided",
     "org.apache.spark" %% "spark-mllib" % sparkVersion % "provided",
-    "org.scala-lang.modules" %% "scala-xml" % "2.3.0"
+    "org.scala-lang.modules" %% "scala-xml" % "2.3.0",
+    "org.scalatest" %% "scalatest" % "3.2.19" % Test
   ),
   assembly / assemblyMergeStrategy := {
     case PathList("META-INF", "MANIFEST.MF")          => MergeStrategy.discard

@@ -37,6 +37,11 @@ object ModelLoader {
   private val SKLEARN_ONNX_FILE = "plate_model.onnx"
   private val LOCATOR_ONNX_FILE = "plate_locator.onnx"
 
+  // Le localisateur se déclenche sur la PROBABILITÉ, pas sur le label discret
+  // du classifieur : évite de rater une plaque quand le RF vote 49/51, et le
+  // seuil reste ajustable indépendamment de la décision plate/background.
+  private val LOCATOR_CONF_THRESHOLD = 0.5
+
   // Normalisation ImageNet (doit correspondre à export_pytorch.py)
   private val IMG_MEAN = Array(0.485f, 0.456f, 0.406f)
   private val IMG_STD  = Array(0.229f, 0.224f, 0.225f)
@@ -224,7 +229,7 @@ object ModelLoader {
               // PREDICT bbox : trace la boîte autour de la plaque détectée
               // (coordonnées YOLO normalisées, clampées [0,1])
               val bboxSeq: Seq[Any] = locatorInfo match {
-                case Some((loc, inputName, shape)) if prediction == "plate" =>
+                case Some((loc, inputName, shape)) if confidence >= LOCATOR_CONF_THRESHOLD =>
                   val (locFlat, locDims) =
                     if (shape.length == 4) { // CNN [batch, 3, S, S]
                       val s = shape(2).toInt
@@ -271,8 +276,9 @@ object ModelLoader {
 
   // ─── Prétraitement image (partagé par les deux modes de scoring) ────────────
 
-  /** Redimensionne en S×S RGB (bilinéaire — cohérent avec PIL côté training). */
-  private def resize(src: BufferedImage, side: Int): BufferedImage = {
+  /** Redimensionne en S×S RGB (bilinéaire — cohérent avec PIL côté training).
+   *  private[ml] : visibilité de test (parité de prétraitement Py↔Scala). */
+  private[ml] def resize(src: BufferedImage, side: Int): BufferedImage = {
     val out = new BufferedImage(side, side, BufferedImage.TYPE_INT_RGB)
     val g   = out.createGraphics()
     g.setRenderingHint(java.awt.RenderingHints.KEY_INTERPOLATION,
@@ -285,7 +291,7 @@ object ModelLoader {
   /** Image → tableau CHW float32, /255, normalisation ImageNet optionnelle.
    *  getRGB en bloc (une seule lecture h·w) : getRGB(x,y) pixel par pixel est
    *  le goulot CPU du scoring (3·h·w appels JNI-like sur le hot path). */
-  private def toFloatCHW(img: BufferedImage, normalizeImageNet: Boolean): Array[Float] = {
+  private[ml] def toFloatCHW(img: BufferedImage, normalizeImageNet: Boolean): Array[Float] = {
     val w      = img.getWidth
     val h      = img.getHeight
     val n      = h * w

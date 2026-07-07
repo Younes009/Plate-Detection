@@ -50,6 +50,7 @@ SOURCE_INGRESS = os.path.join(DATA, "source", "continuous_ingress")
 SOURCE_ML      = os.path.join(DATA, "source", "ml_dataset")
 DEST_INGRESS   = os.path.join(DATA, "dest", "continuous_ingress")
 DEST_ML        = os.path.join(DATA, "dest", "ml_dataset")
+ARCHIVE        = os.path.join(DATA, "archive", "continuous_ingress")
 STAGING        = os.path.join(DATA, "staging")
 OUTPUT         = os.path.join(DATA, "output")
 MODELS         = os.path.join(DATA, "models")
@@ -91,7 +92,7 @@ def run(cmd, **kwargs):
 
 
 def ensure_dirs():
-    for d in [SOURCE_INGRESS, DEST_INGRESS, DEST_ML, STAGING, OUTPUT, MODELS, CHECKPOINT]:
+    for d in [SOURCE_INGRESS, DEST_INGRESS, DEST_ML, ARCHIVE, STAGING, OUTPUT, MODELS, CHECKPOINT]:
         os.makedirs(d, exist_ok=True)
 
 
@@ -190,7 +191,7 @@ def run_consumer() -> subprocess.Popen:
     check_jar(CONSUMER_JAR)
     cmd = SPARK_SUBMIT_ARGS + [
         "--class", "com.project.consumer.ConsumerApp", CONSUMER_JAR,
-        DEST_INGRESS, STAGING, OUTPUT, MODELS, CHECKPOINT,
+        DEST_INGRESS, STAGING, OUTPUT, MODELS, CHECKPOINT, ARCHIVE,
     ]
     print(f"[CMD] {' '.join(cmd)}")
     proc = subprocess.Popen(cmd)
