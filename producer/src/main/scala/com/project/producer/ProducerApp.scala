@@ -112,5 +112,8 @@ object ProducerApp {
 
     println(s"[Producer:$mode] Terminé (${files.size} fichiers) — arrêt du job.")
     sc.stop()
+    // Job éphémère : extinction propre et explicite (code retour 0),
+    // aucun thread ne doit survivre au transfert.
+    sys.exit(0)
   }
 }
