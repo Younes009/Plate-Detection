@@ -48,8 +48,16 @@ object Schemas {
     StructField("processed_at", TimestampType, nullable = false)
   ))
 
-  /** Schéma OUTPUT : staging + colonnes de scoring ajoutées par ModelLoader. */
+  /**
+   * Schéma OUTPUT : staging + colonnes de scoring ajoutées par ModelLoader.
+   * bbox_* = boîte englobante PRÉDITE autour de la plaque (coordonnées YOLO
+   * normalisées [0,1], null si aucun localisateur chargé ou prédiction background).
+   */
   val outputSchema: StructType = stagingSchema
     .add(StructField("prediction",       StringType, nullable = true))
     .add(StructField("confidence_score", DoubleType, nullable = true))
+    .add(StructField("bbox_cx",          DoubleType, nullable = true))
+    .add(StructField("bbox_cy",          DoubleType, nullable = true))
+    .add(StructField("bbox_w",           DoubleType, nullable = true))
+    .add(StructField("bbox_h",           DoubleType, nullable = true))
 }

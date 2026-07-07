@@ -34,11 +34,12 @@ MODELS_PATH    = os.path.join(_BASE, "models")
 IMAGE_EXTS = (".jpg", ".jpeg", ".png")
 
 # Colonnes lues depuis OUTPUT/ — image_data (binaire lourd) volontairement exclue.
-# Le flux continu ne transporte AUCUN label/bbox : le schéma est minimal.
+# bbox_* = boîte PRÉDITE par le localisateur (coordonnées YOLO normalisées).
 READ_COLUMNS = [
     "image_name", "image_path", "length",
     "ingested_at", "processed_at",
     "prediction", "confidence_score",
+    "bbox_cx", "bbox_cy", "bbox_w", "bbox_h",
 ]
 
 PRED_COLORS = {"plate": "#2ecc71", "background": "#95a5a6", "uncertain": "#f39c12"}
@@ -96,13 +97,23 @@ def uri_to_path(uri: str):
 
 
 @st.cache_data(ttl=300, max_entries=64, show_spinner=False)
-def load_image(path: str):
-    """Charge une image du disque pour l'aperçu (pas de bbox : le flux
-    d'inférence ne transporte aucun label — la prédiction est au niveau image)."""
-    from PIL import Image
+def load_image_with_pred_box(path: str, box):
+    """
+    Charge une image du disque et TRACE la bbox PRÉDITE par le localisateur
+    (cx, cy, w, h normalisés — sortie du modèle, pas un label ground truth).
+    """
+    from PIL import Image, ImageDraw
 
-    with Image.open(path) as img:
-        return img.convert("RGB").copy()
+    with Image.open(path) as raw:
+        img = raw.convert("RGB").copy()
+    if box is not None:
+        w, h = img.size
+        cx, cy, bw, bh = box
+        draw = ImageDraw.Draw(img)
+        draw.rectangle([(cx - bw / 2) * w, (cy - bh / 2) * h,
+                        (cx + bw / 2) * w, (cy + bh / 2) * h],
+                       outline="#2ecc71", width=max(2, int(w / 150)))
+    return img
 
 
 def build_traceability(output_df: pd.DataFrame) -> pd.DataFrame:
@@ -309,27 +320,31 @@ with tab_flux:
             .properties(height=180, title="Débit du stream"),
             width="stretch")
 
-        with st.expander("🖼️ Aperçu des dernières images prédites"):
-            recent = (output_df.dropna(subset=["image_path"])
-                      .sort_values("processed_at", ascending=False)
-                      .drop_duplicates("image_name").head(8))
-            cols, shown_imgs = st.columns(4), 0
-            for _, row in recent.iterrows():
-                local = uri_to_path(row["image_path"])
-                if not local:
+        st.subheader("🖼️ Détections — bbox prédite autour de la plaque")
+        recent = (output_df.dropna(subset=["image_path"])
+                  .sort_values("processed_at", ascending=False)
+                  .drop_duplicates("image_name").head(8))
+        cols, shown_imgs = st.columns(4), 0
+        for _, row in recent.iterrows():
+            local = uri_to_path(row["image_path"])
+            if not local:
+                continue
+            box = None
+            if pd.notna(row.get("bbox_cx")):
+                box = (row["bbox_cx"], row["bbox_cy"], row["bbox_w"], row["bbox_h"])
+            with cols[shown_imgs % 4]:
+                try:
+                    st.image(load_image_with_pred_box(local, box), width="stretch")
+                except Exception:
                     continue
-                with cols[shown_imgs % 4]:
-                    try:
-                        st.image(load_image(local), width="stretch")
-                    except Exception:
-                        continue
-                    badge = PRED_COLORS.get(row["prediction"], "#95a5a6")
-                    st.markdown(
-                        f"<code>{row['image_name']}</code><br>"
-                        f"<span style='color:{badge};font-weight:600'>{row['prediction']}</span>"
-                        f" · conf {row['confidence_score']:.2f}",
-                        unsafe_allow_html=True)
-                shown_imgs += 1
+                badge = PRED_COLORS.get(row["prediction"], "#95a5a6")
+                bbox_note = "· 🎯 bbox prédite" if box else "· pas de bbox"
+                st.markdown(
+                    f"<code>{row['image_name']}</code><br>"
+                    f"<span style='color:{badge};font-weight:600'>{row['prediction']}</span>"
+                    f" · conf {row['confidence_score']:.2f} {bbox_note}",
+                    unsafe_allow_html=True)
+            shown_imgs += 1
 
 # ═══ Onglet 2 — Suivi de l'entraînement ══════════════════════════════════════
 
@@ -377,6 +392,15 @@ with tab_training:
                                         f"Matrice de confusion — {split} "
                                         f"(n={m['n_samples']:,})"),
                         width="stretch")
+
+        locator = last.get("locator", {})
+        if locator:
+            st.subheader("Localisation — qualité des bbox prédites (IoU vs ground truth)")
+            loc_cols = st.columns(3 * len(locator))
+            for i, (split, m) in enumerate(locator.items()):
+                loc_cols[3 * i].metric(f"IoU moyen ({split})", f"{m['iou_mean']:.3f}")
+                loc_cols[3 * i + 1].metric(f"IoU ≥ 0.5 ({split})", f"{m['pct_iou_over_50']:.0%}")
+                loc_cols[3 * i + 2].metric(f"MAE coords ({split})", f"{m['mae']:.4f}")
 
         st.subheader("Évolution historique de la précision")
         history = [
