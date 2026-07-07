@@ -421,8 +421,11 @@ with tab_training:
         m4.metric("Runs enregistrés", len(runs))
 
         loc_ok = os.path.exists(os.path.join(MODELS_PATH, "plate_locator.onnx"))
+        n_versions = len(glob.glob(os.path.join(MODELS_PATH, "plate_locator_v*.onnx")))
         st.caption(
-            f"Artefacts : plate_locator.onnx {'✅' if loc_ok else '❌'} · "
+            f"Pointeur actif : plate_locator.onnx {'✅' if loc_ok else '❌'} · "
+            f"artefact du run : `{last.get('model_file', 'plate_locator.onnx')}` · "
+            f"{n_versions} version(s) archivée(s) · "
             f"modèle : {last.get('model', '?')} · "
             f"répartition : {last.get('split_counts', {})}")
 
