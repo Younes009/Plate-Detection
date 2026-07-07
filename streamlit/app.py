@@ -57,16 +57,25 @@ def _image_files(directory: str):
 @st.cache_data(ttl=30, show_spinner="Lecture des Parquet…")
 def load_output() -> pd.DataFrame:
     files = glob.glob(os.path.join(OUTPUT_PATH, "**", "*.parquet"), recursive=True)
-    if not files:
-        return pd.DataFrame(columns=READ_COLUMNS)
     frames = []
     for f in files:
+        # skip files Spark is still writing: _temporary dirs, empty part files
+        try:
+            if "_temporary" in f or os.path.getsize(f) == 0:
+                continue
+        except OSError:
+            continue
         try:
             frames.append(pd.read_parquet(f, columns=READ_COLUMNS))
         except Exception:
-            # older schema: read everything then filter
-            df = pd.read_parquet(f)
-            frames.append(df[[c for c in READ_COLUMNS if c in df.columns]])
+            try:
+                # older schema: read everything then filter
+                df = pd.read_parquet(f)
+                frames.append(df[[c for c in READ_COLUMNS if c in df.columns]])
+            except Exception:
+                continue  # incomplete footer (mid-write) — next refresh gets it
+    if not frames:
+        return pd.DataFrame(columns=READ_COLUMNS)
     # reindex guarantees all expected columns (NaN for old schemas)
     return pd.concat(frames, ignore_index=True).reindex(columns=READ_COLUMNS)
 
