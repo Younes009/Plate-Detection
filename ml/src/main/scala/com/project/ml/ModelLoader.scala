@@ -201,20 +201,31 @@ object ModelLoader {
     out
   }
 
-  /** Image → tableau CHW float32, /255, normalisation ImageNet optionnelle. */
+  /** Image → tableau CHW float32, /255, normalisation ImageNet optionnelle.
+   *  getRGB en bloc (une seule lecture h·w) : getRGB(x,y) pixel par pixel est
+   *  le goulot CPU du scoring (3·h·w appels JNI-like sur le hot path). */
   private def toFloatCHW(img: BufferedImage, normalizeImageNet: Boolean): Array[Float] = {
-    val w    = img.getWidth
-    val h    = img.getHeight
-    val flat = new Array[Float](3 * h * w)
-    for (c <- 0 until 3; y <- 0 until h; x <- 0 until w) {
-      val rgb = img.getRGB(x, y)
-      val px = c match {
-        case 0 => ((rgb >> 16) & 0xFF) / 255.0f
-        case 1 => ((rgb >> 8)  & 0xFF) / 255.0f
-        case 2 => ((rgb)       & 0xFF) / 255.0f
+    val w      = img.getWidth
+    val h      = img.getHeight
+    val n      = h * w
+    val pixels = img.getRGB(0, 0, w, h, null, 0, w)
+    val flat   = new Array[Float](3 * n)
+    var i = 0
+    while (i < n) {
+      val rgb = pixels(i)
+      val r = ((rgb >> 16) & 0xFF) / 255.0f
+      val g = ((rgb >> 8)  & 0xFF) / 255.0f
+      val b = ( rgb        & 0xFF) / 255.0f
+      if (normalizeImageNet) {
+        flat(i)         = (r - IMG_MEAN(0)) / IMG_STD(0)
+        flat(n + i)     = (g - IMG_MEAN(1)) / IMG_STD(1)
+        flat(2 * n + i) = (b - IMG_MEAN(2)) / IMG_STD(2)
+      } else {
+        flat(i)         = r
+        flat(n + i)     = g
+        flat(2 * n + i) = b
       }
-      flat(c * h * w + y * w + x) =
-        if (normalizeImageNet) (px - IMG_MEAN(c)) / IMG_STD(c) else px
+      i += 1
     }
     flat
   }
@@ -228,7 +239,9 @@ object ModelLoader {
 
   // ─── 3. Fallback neutre (aucun modèle disponible) ───────────────────────────
 
+  // prediction AVANT confidence_score : même ordre de colonnes que les chemins
+  // ONNX et que Schemas.outputSchema (sinon Parquet à schéma divergent en OUTPUT).
   def scoreFallback(df: DataFrame): DataFrame =
-    df.withColumn("confidence_score", lit(0.5))
-      .withColumn("prediction", lit("uncertain"))
+    df.withColumn("prediction", lit("uncertain"))
+      .withColumn("confidence_score", lit(0.5))
 }

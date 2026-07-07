@@ -66,10 +66,13 @@ def has_plate_label(image_path: str) -> bool:
 
 def image_to_features(image_path: str) -> np.ndarray:
     """Image → vecteur float32 [3*S*S] : resize S×S RGB, /255, aplati CHW.
-    Doit rester identique au prétraitement de ModelLoader.scala (toFloatCHW)."""
+    Doit rester identique au prétraitement de ModelLoader.scala (toFloatCHW).
+    BILINEAR explicite : le défaut PIL est BICUBIC, alors que le resize Scala
+    (AWT) est bilinéaire — sans ça, distribution train ≠ inférence."""
     from PIL import Image
     with Image.open(image_path) as img:
-        arr = np.asarray(img.convert("RGB").resize((IMG_SIDE, IMG_SIDE)),
+        arr = np.asarray(img.convert("RGB").resize((IMG_SIDE, IMG_SIDE),
+                                                   Image.Resampling.BILINEAR),
                          dtype=np.float32) / 255.0
     return arr.transpose(2, 0, 1).ravel()  # HWC → CHW, aplati
 
