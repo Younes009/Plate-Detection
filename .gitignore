@@ -43,7 +43,7 @@ project/project/
 *.pt
 *.pth
 *.onnx
-license-plate-detection-dataset-10125-images/
+data/source/ml_dataset/
 
 # Images
 *.jpg
