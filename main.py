@@ -60,8 +60,30 @@ PRODUCER_JAR = os.path.join(BASE, "producer", "target", "scala-2.13", "producer-
 CONSUMER_JAR = os.path.join(BASE, "consumer", "target", "scala-2.13", "consumer-assembly-0.1.0.jar")
 SBT_JAR      = os.path.join(BASE, "sbt-launch.jar")
 
-# shutil.which resolves spark-submit.cmd on Windows (Popen alone does not)
-SPARK_SUBMIT = shutil.which("spark-submit") or "spark-submit"
+def resolve_spark_submit():
+    candidates = []
+    spark_home = os.environ.get("SPARK_HOME")
+    if spark_home:
+        bin_dir = os.path.join(spark_home, "bin")
+        if os.name == "nt":
+            candidates.extend([
+                os.path.join(bin_dir, "spark-submit.cmd"),
+                os.path.join(bin_dir, "spark-submit"),
+            ])
+        else:
+            candidates.append(os.path.join(bin_dir, "spark-submit"))
+
+    if os.name == "nt":
+        candidates.append(shutil.which("spark-submit.cmd"))
+    candidates.append(shutil.which("spark-submit"))
+
+    for candidate in candidates:
+        if candidate and os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+SPARK_SUBMIT = resolve_spark_submit() or "spark-submit"
 
 SPARK_SUBMIT_ARGS = [
     SPARK_SUBMIT,
@@ -83,7 +105,13 @@ def log(msg: str):
 
 def run(cmd, **kwargs):
     print(f"[CMD] {' '.join(cmd)}")
-    return subprocess.run(cmd, check=True, **kwargs)
+    try:
+        return subprocess.run(cmd, check=True, **kwargs)
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(
+            f"Unable to start command '{cmd[0]}'. Install Spark and ensure spark-submit is on PATH "
+            f"or set SPARK_HOME to the Spark installation directory."
+        ) from exc
 
 
 def ensure_dirs():
@@ -181,7 +209,13 @@ def run_consumer() -> subprocess.Popen:
         DEST_INGRESS, STAGING, OUTPUT, MODELS, CHECKPOINT, ARCHIVE,
     ]
     print(f"[CMD] {' '.join(cmd)}")
-    proc = subprocess.Popen(cmd)
+    try:
+        proc = subprocess.Popen(cmd)
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(
+            f"Unable to start Spark consumer. Install Spark and ensure spark-submit is on PATH "
+            f"or set SPARK_HOME to the Spark installation directory."
+        ) from exc
     print(f"[INFO] Consumer PID: {proc.pid}")
     return proc
 
